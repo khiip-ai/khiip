@@ -448,3 +448,103 @@ def test_capture_succeeds_when_embedding_fails(isolated_paths):
 
         row = embeddings_store.find_embedding_by_capture_id(app.state.db, capture_id)
         assert row is None  # capture preserved, embedding skipped
+
+
+# ─────────────────────────────────────────────────────────────────────
+# _compose_embed_text — what text gets fed to the embedder per capture
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _make_capture_data(*, title=None, description=None, body=""):
+    """Minimal CaptureData factory for _compose_embed_text tests."""
+    now = datetime.now(timezone.utc)
+    return CaptureData(
+        source="test",
+        source_url="https://test.example/x",
+        recorded_at=now,
+        valid_from=now,
+        title=title,
+        description=description,
+        body_markdown=body,
+    )
+
+
+def test_compose_embed_text_all_three_joined_by_double_newline():
+    from khiip.daemon import _compose_embed_text
+    d = _make_capture_data(title="The Title", description="A description.", body="Body paragraph.")
+    assert _compose_embed_text(d) == "The Title\n\nA description.\n\nBody paragraph."
+
+
+def test_compose_embed_text_title_only():
+    from khiip.daemon import _compose_embed_text
+    d = _make_capture_data(title="Just a title")
+    assert _compose_embed_text(d) == "Just a title"
+
+
+def test_compose_embed_text_description_only():
+    from khiip.daemon import _compose_embed_text
+    d = _make_capture_data(description="Just a description")
+    assert _compose_embed_text(d) == "Just a description"
+
+
+def test_compose_embed_text_body_only():
+    from khiip.daemon import _compose_embed_text
+    d = _make_capture_data(body="Just body content")
+    assert _compose_embed_text(d) == "Just body content"
+
+
+def test_compose_embed_text_title_and_body_skip_missing_description():
+    from khiip.daemon import _compose_embed_text
+    d = _make_capture_data(title="T", body="B")
+    assert _compose_embed_text(d) == "T\n\nB"
+
+
+def test_compose_embed_text_all_empty_returns_empty():
+    from khiip.daemon import _compose_embed_text
+    d = _make_capture_data()
+    assert _compose_embed_text(d) == ""
+
+
+def test_compose_embed_text_empty_string_treated_same_as_none():
+    from khiip.daemon import _compose_embed_text
+    d = _make_capture_data(title="", description="", body="")
+    assert _compose_embed_text(d) == ""
+
+
+# ─────────────────────────────────────────────────────────────────────
+# KHIIP_HOME override banner — lifespan logs warning when env is set
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_khiip_home_banner_emitted_when_env_is_set(
+    isolated_paths, monkeypatch, caplog
+):
+    """Setting KHIIP_HOME must produce a visible startup warning banner."""
+    import logging
+
+    monkeypatch.setenv("KHIIP_HOME", str(isolated_paths["config_dir"].parent))
+    app = _bare_app()
+    with caplog.at_level(logging.WARNING, logger="khiip.daemon"):
+        with TestClient(app) as client:
+            client.get("/health")
+
+    messages = [r.message for r in caplog.records]
+    assert any("KHIIP_HOME override in effect" in m for m in messages)
+    assert any("Production users should not set KHIIP_HOME" in m for m in messages)
+    assert any("GUI clients (Obsidian, Claude Desktop)" in m for m in messages)
+
+
+def test_khiip_home_banner_silent_when_env_unset(
+    isolated_paths, monkeypatch, caplog
+):
+    """No banner should fire when KHIIP_HOME is not set."""
+    import logging
+
+    monkeypatch.delenv("KHIIP_HOME", raising=False)
+    app = _bare_app()
+    with caplog.at_level(logging.WARNING, logger="khiip.daemon"):
+        with TestClient(app) as client:
+            client.get("/health")
+
+    messages = [r.message for r in caplog.records]
+    assert not any("KHIIP_HOME override" in m for m in messages)
