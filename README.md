@@ -59,7 +59,8 @@ Same daemon, multiple surfaces. See [ADR-0003](docs/adr/ADR-0003-strategic-posit
 - ✅ Graph layer architecture locked: custom SQLite (ADR-0007)
 - ✅ Standalone-product lock + Khiip-designed 5+1 canonical vocabulary (ADR-0008)
 - ✅ v0 daemon scaffold + X capture + semantic recall pipeline (Weeks 1-3 of 8)
-- ⏳ Web / PDF / YouTube extractors (Weeks 4-5)
+- ✅ Generic web-article capture via trafilatura (Week 4)
+- ⏳ PDF / YouTube extractors (Week 4-5)
 - ⏳ Obsidian plugin (Weeks 5-6)
 - ⏳ Public launch (Week 7-8 target)
 
@@ -77,22 +78,22 @@ pip install -e ".[dev]"
 # Start the daemon (first run downloads MiniLM-L6 ONNX ~80MB)
 khiipd serve &
 
-# Capture a couple of X tweets
+# Capture an X tweet AND a web article — different extractors, same vault
 khiipd capture https://x.com/jack/status/20
-khiipd capture https://x.com/jack/status/29
+khiipd capture https://developer.mozilla.org/en-US/docs/Web/HTTP/Methods/GET
 
 # Recall by meaning, not by keyword
 khiipd recall "first tweet on twitter"
-khiipd recall "inviting coworkers"
+khiipd recall "HTTP GET method request"
 ```
 
 What you get:
 
 - A SQLite index at `~/.local/share/khiip/index.db`
-- Markdown captures with YAML frontmatter at `~/khiip-vault/captures/x/`
+- Markdown captures with YAML frontmatter at `~/khiip-vault/captures/x/` and `~/khiip-vault/captures/web/`
 - Semantic recall ranked by cosine similarity over bundled MiniLM-L6 embeddings — zero LLM cost, works offline after the first model fetch
 
-What works today: X capture (full QRT chains + X-Article body + engagement metrics + community notes), semantic recall, local-first Markdown vault. What doesn't yet: web/PDF/YouTube capture, Obsidian plugin (use the vault directory directly), PyPI publish (clone the repo).
+What works today: X capture (full QRT chains + X-Article body + engagement metrics + community notes), generic web-article capture (trafilatura — title + author + body extraction), semantic recall, local-first Markdown vault. What doesn't yet: PDF / YouTube capture, Obsidian plugin (vault is plain Markdown though — open it as a vault directly), PyPI publish (`pip install khiip` doesn't work yet; clone the repo).
 
 > **Heads up**: `khiipd serve` listens on `127.0.0.1:8478` by default and reads/writes `~/.config/khiip/` + `~/.local/share/khiip/` + `~/khiip-vault/`. To try Khiip in an isolated sandbox without touching those locations, use `make smoke` or set `KHIIP_HOME=$(mktemp -d) khiipd serve`. See the [Development](#development--running-tests-and-smokes) section below.
 

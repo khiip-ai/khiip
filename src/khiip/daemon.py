@@ -33,7 +33,7 @@ from khiip.config import (
     load_config,
 )
 from khiip.embeddings import Embedder, MiniLMEmbedder
-from khiip.extractors import ExtractorRegistry, XExtractor
+from khiip.extractors import ExtractorRegistry, WebExtractor, XExtractor
 from khiip.extractors.base import CaptureData
 from khiip.models import (
     Capture,
@@ -52,9 +52,15 @@ logger = logging.getLogger("khiip.daemon")
 
 
 def _build_default_registry() -> ExtractorRegistry:
-    """Build the default extractor registry. Factored for test override."""
+    """Build the default extractor registry. Factored for test override.
+
+    Order matters: registry.find() returns the FIRST extractor whose
+    supports(url) is True. Domain-specific extractors must register
+    BEFORE WebExtractor's catch-all http(s) handler.
+    """
     registry = ExtractorRegistry()
-    registry.register(XExtractor())
+    registry.register(XExtractor())  # x.com / twitter.com
+    registry.register(WebExtractor())  # generic http(s) fallback — keep last
     return registry
 
 

@@ -381,3 +381,153 @@ def test_parse_iso_handles_iso_format() -> None:
 def test_parse_iso_returns_none_on_garbage() -> None:
     assert _parse_iso(None) is None
     assert _parse_iso("not a date at all") is None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# WebExtractor — generic article capture via trafilatura
+# ─────────────────────────────────────────────────────────────────────
+
+from khiip.extractors.web import WebExtractor, _parse_metadata_date
+
+
+@pytest.mark.parametrize(
+    "url, expected",
+    [
+        ("https://example.com/article", True),
+        ("http://example.com/article", True),
+        ("https://example.com", True),
+        ("ftp://example.com/file", False),
+        ("file:///etc/passwd", False),
+        ("javascript:alert(1)", False),
+        ("not-a-url", False),
+        ("", False),
+    ],
+)
+def test_webextractor_supports(url: str, expected: bool) -> None:
+    assert WebExtractor().supports(url) is expected
+
+
+def test_webextractor_parse_html_extracts_title_and_body() -> None:
+    """trafilatura returns title from <title> + Markdown body from <article>."""
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>How to Build Software</title>
+      <meta name="author" content="Jane Author">
+      <meta name="description" content="A guide on software construction.">
+      <meta property="article:published_time" content="2026-05-10T12:00:00Z">
+    </head>
+    <body>
+      <article>
+        <h1>How to Build Software</h1>
+        <p>Building software is hard. It requires careful planning.</p>
+        <p>Here is a second paragraph with substantive content.</p>
+      </article>
+    </body>
+    </html>
+    """
+    extractor = WebExtractor()
+    data = extractor._parse_html(html, canonical_url="https://example.com/build-software")
+    assert data.source == "web"
+    assert data.source_url == "https://example.com/build-software"
+    assert data.title == "How to Build Software"
+    assert data.description == "A guide on software construction."
+    assert data.author == "Jane Author"
+    assert "Building software is hard" in data.body_markdown
+    assert "second paragraph" in data.body_markdown
+    # Published date parsed into valid_from
+    assert data.valid_from.year == 2026
+    assert data.valid_from.month == 5
+    assert data.valid_from.day == 10
+
+
+def test_webextractor_parse_html_empty_article_returns_capturedata_with_empty_body() -> None:
+    """Non-article pages (login walls, SPAs) produce a CaptureData with thin/empty body, not a raise."""
+    html = "<html><head><title>Login</title></head><body><form></form></body></html>"
+    data = WebExtractor()._parse_html(html, canonical_url="https://example.com/login")
+    assert data.source == "web"
+    assert data.title == "Login"
+    # body_markdown may be empty for non-article pages; the contract is "always return CaptureData"
+    assert isinstance(data.body_markdown, str)
+
+
+def test_webextractor_parse_html_no_date_metadata_falls_back_to_recorded_at() -> None:
+    """When trafilatura can't find a publish date, valid_from == recorded_at."""
+    html = "<html><head><title>Undated</title></head><body><article><p>x</p></article></body></html>"
+    data = WebExtractor()._parse_html(html, canonical_url="https://example.com/x")
+    assert data.valid_from == data.recorded_at
+
+
+def test_webextractor_extract_hits_http_and_canonicalizes_url() -> None:
+    """extract() fetches via the injected httpx client + uses post-redirect URL."""
+    html = "<html><head><title>Real Article</title></head><body><article><p>Body content here for the article body.</p></article></body></html>"
+    response = MagicMock(spec=httpx.Response)
+    response.text = html
+    response.url = "https://example.com/canonical"  # after redirect
+    response.raise_for_status = MagicMock()
+
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=response)
+
+    data = WebExtractor(http_client=client).extract("https://example.com/short")
+    client.get.assert_called_once_with("https://example.com/short")
+    response.raise_for_status.assert_called_once()
+    assert data.source_url == "https://example.com/canonical"
+    assert data.title == "Real Article"
+
+
+def test_webextractor_extract_propagates_http_error() -> None:
+    """4xx/5xx upstream → raise_for_status fires → daemon turns into 502."""
+    response = MagicMock(spec=httpx.Response)
+    response.raise_for_status = MagicMock(side_effect=httpx.HTTPStatusError("404", request=MagicMock(), response=MagicMock()))
+
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=response)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        WebExtractor(http_client=client).extract("https://example.com/missing")
+
+
+def test_parse_metadata_date_handles_iso_date_only() -> None:
+    """trafilatura.Document.date is typically YYYY-MM-DD; assume UTC."""
+    dt = _parse_metadata_date("2026-05-15")
+    assert dt is not None
+    assert (dt.year, dt.month, dt.day) == (2026, 5, 15)
+    assert dt.tzinfo is not None  # UTC stamped
+
+
+def test_parse_metadata_date_handles_full_iso_z() -> None:
+    dt = _parse_metadata_date("2026-05-15T12:00:00Z")
+    assert dt is not None
+    assert dt.year == 2026
+    assert dt.tzinfo is not None
+
+
+def test_parse_metadata_date_returns_none_for_unparseable() -> None:
+    assert _parse_metadata_date(None) is None
+    assert _parse_metadata_date("") is None
+    assert _parse_metadata_date("not a date") is None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Registry ordering — X first, Web fallback last
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_registry_order_x_claims_x_urls_web_claims_others() -> None:
+    """XExtractor must be tried before WebExtractor so x.com URLs don't fall through."""
+    from khiip.extractors.x import XExtractor
+    registry = ExtractorRegistry()
+    registry.register(XExtractor())
+    registry.register(WebExtractor())
+
+    # x.com URL → XExtractor
+    found_x = registry.find("https://x.com/jack/status/20")
+    assert found_x is not None
+    assert found_x.source == "x"
+
+    # Generic article → WebExtractor
+    found_web = registry.find("https://example.com/article")
+    assert found_web is not None
+    assert found_web.source == "web"

@@ -11,6 +11,13 @@ Bluesky in v0.5.
 """
 
 from khiip.extractors.base import CaptureData, Extractor, ExtractorRegistry
+from khiip.extractors.web import WebExtractor
 from khiip.extractors.x import XExtractor
 
-__all__ = ["CaptureData", "Extractor", "ExtractorRegistry", "XExtractor"]
+__all__ = [
+    "CaptureData",
+    "Extractor",
+    "ExtractorRegistry",
+    "WebExtractor",
+    "XExtractor",
+]
