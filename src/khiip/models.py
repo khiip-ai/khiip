@@ -125,6 +125,31 @@ class Edge(BaseModel):
 
 
 # ───────────────────────────────────────────────────────────────────────────
+# Recall
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class RecallHit(BaseModel):
+    """A single recall result: capture + cosine similarity score."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    capture: Capture
+    score: float = Field(..., ge=-1.0, le=1.0, description="Cosine similarity in [-1.0, 1.0].")
+
+
+class RecallResponse(BaseModel):
+    """Response body for GET /api/v1/recall."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str
+    embedder_model: str
+    embedder_dimension: int
+    results: list[RecallHit]
+
+
+# ───────────────────────────────────────────────────────────────────────────
 # Health
 # ───────────────────────────────────────────────────────────────────────────
 
@@ -145,4 +170,6 @@ __all__ = [
     "EdgeCreate",
     "EdgeType",
     "HealthResponse",
+    "RecallHit",
+    "RecallResponse",
 ]

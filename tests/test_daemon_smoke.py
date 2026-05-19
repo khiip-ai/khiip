@@ -1,4 +1,4 @@
-"""Smoke tests for the FastAPI daemon: lifespan + health + auth + captures."""
+"""Smoke tests for the FastAPI daemon: lifespan + health + auth + captures + recall."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ from fastapi.testclient import TestClient
 
 from khiip.daemon import create_app
 from khiip.extractors.base import CaptureData, ExtractorRegistry
+
+from .conftest import StubEmbedder
 
 # ─────────────────────────────────────────────────────────────────────
 # Stub extractor — deterministic, no network
@@ -42,12 +44,13 @@ class StubExtractor:
         )
 
 
-def _app_with_stub(*, fail: bool = False):
-    """Create a fresh daemon app with the stub extractor pre-registered."""
+def _app_with_stub(*, fail: bool = False, embedder: StubEmbedder | None = None):
+    """Create a fresh daemon app with stubbed extractor + embedder pre-registered."""
     app = create_app()
     registry = ExtractorRegistry()
     registry.register(StubExtractor(fail=fail))
     app.state.extractors = registry
+    app.state.embedder = embedder or StubEmbedder()
     return app
 
 
@@ -56,9 +59,16 @@ def _app_with_stub(*, fail: bool = False):
 # ─────────────────────────────────────────────────────────────────────
 
 
+def _bare_app():
+    """create_app() with only the embedder stubbed — preserves default extractor registry."""
+    app = create_app()
+    app.state.embedder = StubEmbedder()
+    return app
+
+
 def test_health_no_auth_required(isolated_paths):
     """GET /health works without Authorization header."""
-    app = create_app()
+    app = _bare_app()
     with TestClient(app) as client:
         response = client.get("/health")
         assert response.status_code == 200
@@ -70,7 +80,7 @@ def test_health_no_auth_required(isolated_paths):
 
 def test_meta_requires_auth(isolated_paths):
     """GET /api/v1/meta without auth returns 401."""
-    app = create_app()
+    app = _bare_app()
     with TestClient(app) as client:
         response = client.get("/api/v1/meta")
         assert response.status_code == 401
@@ -78,7 +88,7 @@ def test_meta_requires_auth(isolated_paths):
 
 def test_meta_with_valid_auth_returns_200(isolated_paths):
     """GET /api/v1/meta with the daemon's generated key returns 200."""
-    app = create_app()
+    app = _bare_app()
     with TestClient(app) as client:
         client.get("/health")
         api_key = app.state.api_key
@@ -91,11 +101,13 @@ def test_meta_with_valid_auth_returns_200(isolated_paths):
         assert "extractors" in data
         # default registry registers XExtractor
         assert "x" in data["extractors"]
+        # embedder block reports the stub injected by _bare_app
+        assert data["embedder"]["model"] == "stub-embedder-v1"
 
 
 def test_meta_with_invalid_auth_returns_401(isolated_paths):
     """GET /api/v1/meta with a wrong key returns 401."""
-    app = create_app()
+    app = _bare_app()
     with TestClient(app) as client:
         response = client.get(
             "/api/v1/meta", headers={"Authorization": "Bearer khiip_wrong_key_value"}
@@ -260,3 +272,175 @@ def test_list_captures_returns_newest_first(isolated_paths):
         filtered = client.get("/api/v1/captures?source=x", headers=headers)
         assert filtered.status_code == 200
         assert filtered.json() == []
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Embeddings + GET /api/v1/recall
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TopicExtractor:
+    """Extractor whose body text is controlled per URL — drives recall tests."""
+
+    source: str = "topic"
+
+    def __init__(self, bodies: dict[str, tuple[str, str]]) -> None:
+        # bodies: {url_suffix: (title, body)}
+        self._bodies = bodies
+
+    def supports(self, url: str) -> bool:
+        return url.startswith("https://topic.test/")
+
+    def extract(self, url: str):
+        suffix = url.removeprefix("https://topic.test/")
+        title, body = self._bodies[suffix]
+        now = datetime.now(timezone.utc)
+        return CaptureData(
+            source=self.source,
+            source_url=url,
+            recorded_at=now,
+            valid_from=now,
+            title=title,
+            description=None,
+            author="topic-author",
+            body_markdown=body,
+        )
+
+
+def _app_with_topic_extractor(bodies, embedder=None):
+    app = create_app()
+    registry = ExtractorRegistry()
+    registry.register(TopicExtractor(bodies))
+    app.state.extractors = registry
+    app.state.embedder = embedder or StubEmbedder()
+    return app
+
+
+def test_post_capture_writes_embedding_row(isolated_paths):
+    """A successful capture inserts a row into `embeddings` for the new capture."""
+    app = _app_with_stub()
+    with TestClient(app) as client:
+        client.get("/health")
+        api_key = app.state.api_key
+        headers = {"Authorization": f"Bearer {api_key}"}
+
+        response = client.post(
+            "/api/v1/captures",
+            json={"url": "https://stub.test/example/embed-row"},
+            headers=headers,
+        )
+        assert response.status_code == 201
+        capture_id = response.json()["id"]
+
+        from khiip.storage import embeddings_store
+
+        row = embeddings_store.find_embedding_by_capture_id(app.state.db, capture_id)
+        assert row is not None
+        assert row["model"] == "stub-embedder-v1"
+        assert row["dimension"] == app.state.embedder.dimension
+        assert row["vector"].shape == (app.state.embedder.dimension,)
+
+
+def test_recall_returns_topic_matched_capture_first(isolated_paths):
+    """Recall ranks captures sharing query tokens above unrelated ones."""
+    bodies = {
+        "rust":   ("Rust ownership", "rust ownership borrow checker lifetime"),
+        "python": ("Python decorators", "python decorators metaclass dunder"),
+        "cooking": ("Pasta recipe", "tomato olive oil garlic basil pasta"),
+    }
+    app = _app_with_topic_extractor(bodies)
+    with TestClient(app) as client:
+        client.get("/health")
+        api_key = app.state.api_key
+        headers = {"Authorization": f"Bearer {api_key}"}
+
+        ids = {}
+        for slug in bodies:
+            r = client.post(
+                "/api/v1/captures",
+                json={"url": f"https://topic.test/{slug}"},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+            ids[slug] = r.json()["id"]
+
+        # Query overlapping with the rust body → rust should rank #1
+        r = client.get(
+            "/api/v1/recall",
+            params={"q": "rust borrow checker", "limit": 3},
+            headers=headers,
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["embedder_model"] == "stub-embedder-v1"
+        assert body["query"] == "rust borrow checker"
+        assert len(body["results"]) >= 1
+        top = body["results"][0]
+        assert top["capture"]["id"] == ids["rust"]
+        assert top["score"] > 0.0
+
+
+def test_recall_empty_corpus_returns_no_results(isolated_paths):
+    """With no captures, recall returns an empty results list (not 5xx)."""
+    app = _app_with_stub()
+    with TestClient(app) as client:
+        client.get("/health")
+        api_key = app.state.api_key
+
+        r = client.get(
+            "/api/v1/recall",
+            params={"q": "anything"},
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["results"] == []
+        assert body["embedder_model"] == "stub-embedder-v1"
+
+
+def test_recall_requires_auth(isolated_paths):
+    """GET /api/v1/recall without auth returns 401."""
+    app = _app_with_stub()
+    with TestClient(app) as client:
+        r = client.get("/api/v1/recall", params={"q": "anything"})
+        assert r.status_code == 401
+
+
+def test_recall_rejects_empty_query(isolated_paths):
+    """GET /api/v1/recall with empty q returns 422 (FastAPI validation)."""
+    app = _app_with_stub()
+    with TestClient(app) as client:
+        client.get("/health")
+        api_key = app.state.api_key
+        r = client.get(
+            "/api/v1/recall",
+            params={"q": ""},
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        assert r.status_code == 422
+
+
+def test_capture_succeeds_when_embedding_fails(isolated_paths):
+    """If embed() raises, capture still lands; no embedding row inserted."""
+
+    class FailingEmbedder(StubEmbedder):
+        def embed(self, text: str) -> list[float]:
+            raise RuntimeError("simulated embedder failure")
+
+    app = _app_with_stub(embedder=FailingEmbedder())
+    with TestClient(app) as client:
+        client.get("/health")
+        api_key = app.state.api_key
+
+        r = client.post(
+            "/api/v1/captures",
+            json={"url": "https://stub.test/example/embed-fail"},
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        assert r.status_code == 201, r.text
+        capture_id = r.json()["id"]
+
+        from khiip.storage import embeddings_store
+
+        row = embeddings_store.find_embedding_by_capture_id(app.state.db, capture_id)
+        assert row is None  # capture preserved, embedding skipped

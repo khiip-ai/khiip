@@ -16,16 +16,27 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Annotated
 
+import hashlib
+
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from ulid import ULID
 
 from khiip.auth import verify_bearer
 from khiip.config import KhiipConfig, auth_key_fingerprint, ensure_auth, load_config
+from khiip.embeddings import Embedder, MiniLMEmbedder
 from khiip.extractors import ExtractorRegistry, XExtractor
-from khiip.models import Capture, CaptureCreate, HealthResponse
+from khiip.extractors.base import CaptureData
+from khiip.models import (
+    Capture,
+    CaptureCreate,
+    HealthResponse,
+    RecallHit,
+    RecallResponse,
+)
 from khiip.storage import captures as storage_captures
 from khiip.storage import db as storage_db
+from khiip.storage import embeddings_store
 from khiip.storage import filesystem as storage_fs
 from khiip.version import __version__
 
@@ -37,6 +48,29 @@ def _build_default_registry() -> ExtractorRegistry:
     registry = ExtractorRegistry()
     registry.register(XExtractor())
     return registry
+
+
+def _build_default_embedder() -> Embedder:
+    """Build the default embedder (MiniLM-L6 ONNX). Factored for test override."""
+    return MiniLMEmbedder()
+
+
+def _compose_embed_text(data: CaptureData) -> str:
+    """Compose the text we feed to the embedder per capture.
+
+    Locked 2026-05-19: title + description + body. fastembed truncates at the
+    model's max sequence length (256 tokens for MiniLM-L6) internally; we don't
+    truncate upstream so a future swap to a larger-context embedder picks up
+    the trailing content automatically.
+    """
+    parts: list[str] = []
+    if data.title:
+        parts.append(data.title)
+    if data.description:
+        parts.append(data.description)
+    if data.body_markdown:
+        parts.append(data.body_markdown)
+    return "\n\n".join(parts)
 
 
 @asynccontextmanager
@@ -72,6 +106,17 @@ async def lifespan(app: FastAPI):
     if not hasattr(app.state, "extractors"):
         app.state.extractors = _build_default_registry()
     logger.info("extractors registered: %d", len(app.state.extractors))
+
+    # Same injection pattern for the embedder — tests inject StubEmbedder
+    # before TestClient(app) triggers lifespan.
+    if not hasattr(app.state, "embedder"):
+        app.state.embedder = _build_default_embedder()
+    embedder: Embedder = app.state.embedder
+    try:
+        embedder.warmup()
+        logger.info("embedder ready: %s (dim=%d)", embedder.model_name, embedder.dimension)
+    except Exception:
+        logger.exception("embedder warmup failed; recall will return empty until resolved")
 
     try:
         yield
@@ -117,6 +162,7 @@ def create_app() -> FastAPI:
     @app.get("/api/v1/meta", tags=["meta"])
     def meta(_auth: Annotated[str, Depends(verify_bearer)]) -> dict:
         """Authenticated meta endpoint — confirms key + reports daemon state."""
+        embedder: Embedder = app.state.embedder
         return {
             "version": __version__,
             "schema_version": storage_db.schema_version(app.state.db),
@@ -126,6 +172,10 @@ def create_app() -> FastAPI:
                 "vault_path": str(app.state.config.vault_path),
             },
             "extractors": [ex.source for ex in app.state.extractors],
+            "embedder": {
+                "model": embedder.model_name,
+                "dimension": embedder.dimension,
+            },
         }
 
     @app.post(
@@ -203,6 +253,29 @@ def create_app() -> FastAPI:
                 vault_path=str(vault_rel),
             )
 
+        # Embed the capture for semantic recall. Capture is sacred — if the
+        # embedder fails, we log + continue; the capture still lands and
+        # remains backfillable via a future `khiipd embed --backfill` command.
+        embedder: Embedder = app.state.embedder
+        embed_text = _compose_embed_text(capture_data)
+        if embed_text:
+            try:
+                vector = embedder.embed(embed_text)
+                with storage_db.transaction(conn):
+                    embeddings_store.insert_embedding(
+                        conn,
+                        capture_id=capture_id,
+                        model=embedder.model_name,
+                        dimension=embedder.dimension,
+                        vector=vector,
+                        content_sha256=hashlib.sha256(embed_text.encode("utf-8")).hexdigest(),
+                    )
+            except Exception:
+                logger.exception(
+                    "embedding failed for capture %s; capture preserved, recall will skip it",
+                    capture_id,
+                )
+
         stored = storage_captures.find_capture_by_id(conn, capture_id)
         assert stored is not None  # just inserted
         return stored
@@ -231,6 +304,61 @@ def create_app() -> FastAPI:
         """GET /api/v1/captures — list captures, newest first."""
         return storage_captures.list_captures(
             app.state.db, source=source, limit=limit, offset=offset
+        )
+
+    @app.get("/api/v1/recall", tags=["recall"], response_model=RecallResponse)
+    def recall(
+        _auth: Annotated[str, Depends(verify_bearer)],
+        q: str = Query(..., min_length=1, description="Natural-language recall query."),
+        limit: int = Query(default=10, ge=1, le=100),
+    ) -> RecallResponse:
+        """GET /api/v1/recall — semantic top-k over embedded captures.
+
+        Pipeline:
+        1. Embed query with the daemon's configured embedder
+        2. Load all stored vectors matching that embedder's model
+        3. Cosine top-k
+        4. Hydrate Capture rows + return with scores
+
+        Captures without embeddings (embedder failed at capture time, or stored
+        under a different model than the current one) are silently excluded —
+        a future `khiipd embed --backfill` command will repair the gap.
+        """
+        embedder: Embedder = app.state.embedder
+        conn = app.state.db
+
+        records = embeddings_store.load_all_vectors(conn, model=embedder.model_name)
+        if not records:
+            return RecallResponse(
+                query=q,
+                embedder_model=embedder.model_name,
+                embedder_dimension=embedder.dimension,
+                results=[],
+            )
+
+        try:
+            query_vector = embedder.embed(q)
+        except Exception as exc:
+            logger.exception("embedder failed on recall query")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"embedder unavailable: {exc}",
+            ) from exc
+
+        ranked = embeddings_store.cosine_topk(query_vector, records, limit=limit)
+
+        hits: list[RecallHit] = []
+        for capture_id, score in ranked:
+            capture = storage_captures.find_capture_by_id(conn, capture_id)
+            if capture is None:  # embedding outlived its capture (cascade deletes guard this)
+                continue
+            hits.append(RecallHit(capture=capture, score=score))
+
+        return RecallResponse(
+            query=q,
+            embedder_model=embedder.model_name,
+            embedder_dimension=embedder.dimension,
+            results=hits,
         )
 
     return app
