@@ -1,0 +1,10 @@
+# CODEOWNERS for github.com/khiip-ai/khiip
+#
+# Boundary-gate files: changes to these must be reviewed by the founder
+# because they govern what can/can't be committed to the public repo.
+# (See ADR-Ω restructure 2026-05-19 in khiip-ai/internal CHRONICLE.)
+
+/.gitignore                 @Jttmw
+/.pre-commit-config.yaml    @Jttmw
+/.github/workflows/         @Jttmw
+/CODEOWNERS                 @Jttmw

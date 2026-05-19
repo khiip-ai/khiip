@@ -1,0 +1,24 @@
+name: path-guard
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  path-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Block internal-only paths
+        run: |
+          set -euo pipefail
+          MATCH=$(git ls-files | grep -E "(^|/)(HANDOFF\.md|CHRONICLE\.md|AGENTS\.md|SESSION-SUMMARY-.*\.md|_internal/|khiip-internal/|docs/research/|docs/strategy/|docs/product/naming-brief\.md|docs/product/naming-research-synthesis\.md|docs/product/canonical-edge-template-mapping\.md|docs/product/v0-spec\.md|docs/methodology/jtbd-framework\.md|docs/adr/ADR-[0-9]+-decision-prep\.md)$" || true)
+          if [ -n "$MATCH" ]; then
+            echo "::error::Internal-only paths detected in public repo. These belong in github.com/khiip-ai/internal:"
+            echo "$MATCH"
+            exit 1
+          fi
+          echo "✓ No internal-only paths detected."

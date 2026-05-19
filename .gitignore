@@ -1,42 +1,42 @@
+# Secrets / credentials
 .env
 .env.*
 *.key
 *.pem
 .aws/
 .config/khiip/
+
+# OS / editor
 .DS_Store
 .vscode/
 .idea/
 *.swp
+
+# Python
 __pycache__/
 *.pyc
+*.egg-info/
 .venv/
 venv/
-*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.python-version
+
+# JS (plugin scaffolding when added)
 node_modules/
+
+# Runtime data (daemon writes locally)
 *.sqlite
 *.db
 *.log
-dist/
-build/
 
-# Internal-only documentation (private to founder; per 2026-05-19 clean-break decision)
-# These files stay in the local working tree for personal calibration + ongoing work
-# but are deliberately excluded from the public github.com/khiip-ai/khiip repo
-/CHRONICLE.md
-/HANDOFF.md
-/docs/research/
-/docs/strategy/
-/docs/product/naming-brief.md
-/docs/product/naming-research-synthesis.md
-/docs/product/canonical-edge-template-mapping.md
-/docs/adr/ADR-0002-decision-prep.md
-/SESSION-SUMMARY-*.md
-
-# Internal-only operations docs (industry-aligned tighter public surface decision 2026-05-19):
-# AGENTS.md / v0-spec / jtbd-framework are internal developer notebooks + PRDs;
-# public-facing equivalents (README + ADRs + LICENSE) cover the customer needs
-/AGENTS.md
+# Agent-context stub + internal-companion-repo sentinels.
+# Operational + spec context lives in github.com/khiip-ai/internal,
+# loaded at session start via the gitignored CLAUDE.md stub.
+# Pre-commit hook + CI path-guard + CODEOWNERS + GitHub push protection
+# enforce this boundary; this gitignore is a soft outer layer.
 /CLAUDE.md
-/docs/product/v0-spec.md
-/docs/methodology/jtbd-framework.md
+/_internal/
+/khiip-internal/

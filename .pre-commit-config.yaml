@@ -1,0 +1,25 @@
+# Pre-commit hooks for github.com/khiip-ai/khiip (public AGPL-3.0 repo).
+#
+# Two hooks, both blocking:
+#  1. gitleaks  — generic secret-scanner; covers .env-style leaks, API tokens, etc.
+#  2. khiip-path-guard — Khiip-specific regex blocking internal-only paths
+#     that belong in the companion private repo github.com/khiip-ai/internal.
+#
+# After cloning, run `pre-commit install` once to wire these into local git.
+# CI runs the equivalent path-guard regex in `.github/workflows/path-guard.yml`
+# as a required status check, so the boundary is also enforced server-side.
+
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: khiip-path-guard
+        name: Block internal-only paths from public repo
+        entry: _scripts/path-guard.sh
+        language: script
+        pass_filenames: false
+        stages: [pre-commit]
