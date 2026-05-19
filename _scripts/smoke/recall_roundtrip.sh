@@ -16,6 +16,15 @@
 
 set -euo pipefail
 
+# Pre-flight: port collision check. If another khiipd (or any HTTP server)
+# is already on 127.0.0.1:8478, the smoke's sandbox auth.toml won't match
+# the running daemon's and the test would fail confusingly with 401s.
+if curl -fsS -m 1 http://127.0.0.1:8478/health >/dev/null 2>&1; then
+    echo "✗ port 8478 already in use — is another daemon running?"
+    echo "  stop it first (or kill the conflicting process), then re-run smoke."
+    exit 1
+fi
+
 KHIIP_HOME="$(mktemp -d -t khiip-smoke.XXXXXX)"
 export KHIIP_HOME
 echo "→ KHIIP_HOME=$KHIIP_HOME"
