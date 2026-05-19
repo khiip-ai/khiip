@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
 
-from khiip.daemon import create_app
+from khiip.daemon import _compose_embed_text, create_app
 from khiip.extractors.base import CaptureData, ExtractorRegistry
 
 from .conftest import StubEmbedder
@@ -470,43 +470,36 @@ def _make_capture_data(*, title=None, description=None, body=""):
 
 
 def test_compose_embed_text_all_three_joined_by_double_newline():
-    from khiip.daemon import _compose_embed_text
     d = _make_capture_data(title="The Title", description="A description.", body="Body paragraph.")
     assert _compose_embed_text(d) == "The Title\n\nA description.\n\nBody paragraph."
 
 
 def test_compose_embed_text_title_only():
-    from khiip.daemon import _compose_embed_text
     d = _make_capture_data(title="Just a title")
     assert _compose_embed_text(d) == "Just a title"
 
 
 def test_compose_embed_text_description_only():
-    from khiip.daemon import _compose_embed_text
     d = _make_capture_data(description="Just a description")
     assert _compose_embed_text(d) == "Just a description"
 
 
 def test_compose_embed_text_body_only():
-    from khiip.daemon import _compose_embed_text
     d = _make_capture_data(body="Just body content")
     assert _compose_embed_text(d) == "Just body content"
 
 
 def test_compose_embed_text_title_and_body_skip_missing_description():
-    from khiip.daemon import _compose_embed_text
     d = _make_capture_data(title="T", body="B")
     assert _compose_embed_text(d) == "T\n\nB"
 
 
 def test_compose_embed_text_all_empty_returns_empty():
-    from khiip.daemon import _compose_embed_text
     d = _make_capture_data()
     assert _compose_embed_text(d) == ""
 
 
 def test_compose_embed_text_empty_string_treated_same_as_none():
-    from khiip.daemon import _compose_embed_text
     d = _make_capture_data(title="", description="", body="")
     assert _compose_embed_text(d) == ""
 
