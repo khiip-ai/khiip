@@ -288,6 +288,10 @@ def create_app() -> FastAPI:
         if embed_text:
             try:
                 vector = embedder.embed(embed_text)
+                # content_sha256 is write-only today; reserved for a future
+                # passive-tracking pipeline (decay-cadence refresh + velocity-spike
+                # trigger) that re-embeds a capture only when its upstream body
+                # has actually changed, leaving engagement-only updates alone.
                 with storage_db.transaction(conn):
                     embeddings_store.insert_embedding(
                         conn,
