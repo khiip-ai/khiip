@@ -49,7 +49,7 @@ Same daemon, multiple surfaces. See [ADR-0003](docs/adr/ADR-0003-strategic-posit
 
 ## Current status
 
-**Pre-launch.** All foundational ADRs LOCKED; Week 1 v0 build unblocked on architectural-decision grounds.
+**Pre-launch — alpha tech preview.** All foundational ADRs LOCKED; X capture + semantic recall pipeline working end-to-end.
 
 - ✅ Strategic positioning locked (ADR-0003)
 - ✅ Name + brand locked (ADR-0004)
@@ -58,9 +58,43 @@ Same daemon, multiple surfaces. See [ADR-0003](docs/adr/ADR-0003-strategic-posit
 - ✅ Shape D promoted as primary mass-market path (ADR-0006)
 - ✅ Graph layer architecture locked: custom SQLite (ADR-0007)
 - ✅ Standalone-product lock + Khiip-designed 5+1 canonical vocabulary (ADR-0008)
-- ✅ v0 product spec promoted to load-bearing
-- ⏳ Week 1 v0 build kickoff
+- ✅ v0 daemon scaffold + X capture + semantic recall pipeline (Weeks 1-3 of 8)
+- ⏳ Web / PDF / YouTube extractors (Weeks 4-5)
+- ⏳ Obsidian plugin (Weeks 5-6)
 - ⏳ Public launch (Week 7-8 target)
+
+---
+
+## Quickstart (60-second demo)
+
+What runs today: clone, install, capture an X tweet, recall it by meaning.
+
+```bash
+git clone https://github.com/khiip-ai/khiip.git ~/projects/khiip
+cd ~/projects/khiip
+pip install -e ".[dev]"
+
+# Start the daemon (first run downloads MiniLM-L6 ONNX ~80MB)
+khiipd serve &
+
+# Capture a couple of X tweets
+khiipd capture https://x.com/jack/status/20
+khiipd capture https://x.com/jack/status/29
+
+# Recall by meaning, not by keyword
+khiipd recall "first tweet on twitter"
+khiipd recall "inviting coworkers"
+```
+
+What you get:
+
+- A SQLite index at `~/.local/share/khiip/index.db`
+- Markdown captures with YAML frontmatter at `~/khiip-vault/captures/x/`
+- Semantic recall ranked by cosine similarity over bundled MiniLM-L6 embeddings — zero LLM cost, works offline after the first model fetch
+
+What works today: X capture (full QRT chains + X-Article body + engagement metrics + community notes), semantic recall, local-first Markdown vault. What doesn't yet: web/PDF/YouTube capture, Obsidian plugin (use the vault directory directly), PyPI publish (clone the repo).
+
+> **Heads up**: `khiipd serve` listens on `127.0.0.1:8478` by default and reads/writes `~/.config/khiip/` + `~/.local/share/khiip/` + `~/khiip-vault/`. To try Khiip in an isolated sandbox without touching those locations, use `make smoke` or set `KHIIP_HOME=$(mktemp -d) khiipd serve`. See the [Development](#development--running-tests-and-smokes) section below.
 
 ---
 

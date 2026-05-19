@@ -51,22 +51,19 @@ if [[ "$READY" -eq 0 ]]; then
 fi
 echo "→ daemon ready"
 
-API_KEY=$(python3 -c "import tomllib; print(tomllib.load(open('$KHIIP_HOME/config/auth.toml','rb'))['api_key'])")
+# Exercise the public CLI surface (khiipd capture / khiipd recall) — the
+# same commands documented in the README quickstart. Auth is auto-discovered
+# from $KHIIP_HOME/config/auth.toml via ensure_auth().
 
-echo "→ POST /api/v1/captures https://x.com/jack/status/20"
-curl -fsS -X POST \
-    -H "Authorization: Bearer $API_KEY" \
-    -H "Content-Type: application/json" \
-    -d '{"url":"https://x.com/jack/status/20"}' \
-    http://127.0.0.1:8478/api/v1/captures >/dev/null
+echo "→ khiipd capture https://x.com/jack/status/20"
+khiipd capture https://x.com/jack/status/20 >/dev/null
 
-echo "→ GET /api/v1/recall?q=first+tweet+on+twitter"
-COUNT=$(curl -fsS -G \
-    -H "Authorization: Bearer $API_KEY" \
-    --data-urlencode "q=first tweet on twitter" \
-    http://127.0.0.1:8478/api/v1/recall \
-    | python3 -c "import json,sys; print(len(json.load(sys.stdin)['results']))")
+echo "→ khiipd recall 'first tweet on twitter' --limit 3"
+RECALL_OUTPUT=$(khiipd recall "first tweet on twitter" --limit 3)
+echo "$RECALL_OUTPUT"
 
+# Each hit is two lines (score+title, then url); count score-prefixed lines.
+COUNT=$(echo "$RECALL_OUTPUT" | grep -cE "^  [0-9]+\.[0-9]+  " || true)
 if [[ "$COUNT" -lt 1 ]]; then
     echo "✗ recall returned 0 results"
     exit 1
