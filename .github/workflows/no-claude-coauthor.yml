@@ -1,0 +1,34 @@
+name: no-claude-coauthor
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  scan-commits:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan commit messages for Co-Authored-By Claude trailers
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            RANGE="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          else
+            RANGE="${{ github.event.before }}..${{ github.event.after }}"
+            if [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+              RANGE="HEAD"
+            fi
+          fi
+          MATCH=$(git log "$RANGE" --format='%H %s%n%b' | grep -E "^Co-Authored-By:.*Claude" || true)
+          if [ -n "$MATCH" ]; then
+            echo "::error::Co-Authored-By Claude trailers detected. Project norm 2026-05-19: AI co-authorship is not recorded in this project's git history."
+            echo "$MATCH"
+            exit 1
+          fi
+          echo "✓ No Co-Authored-By Claude trailers detected."

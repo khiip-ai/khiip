@@ -1,13 +1,19 @@
 # Pre-commit hooks for github.com/khiip-ai/khiip (public AGPL-3.0 repo).
 #
-# Two hooks, both blocking:
-#  1. gitleaks  — generic secret-scanner; covers .env-style leaks, API tokens, etc.
-#  2. khiip-path-guard — Khiip-specific regex blocking internal-only paths
-#     that belong in the companion private repo github.com/khiip-ai/internal.
+# Three hooks, all blocking:
+#  1. gitleaks            — generic secret-scanner; covers .env-style leaks, API tokens, etc.
+#  2. khiip-path-guard    — regex blocking internal-only paths that belong in
+#                            the companion private repo github.com/khiip-ai/internal.
+#  3. no-claude-coauthor  — block `Co-Authored-By: Claude*` trailers in commit messages.
+#                            Project norm 2026-05-19: AI co-authorship is not recorded
+#                            in this project's git history.
 #
-# After cloning, run `pre-commit install` once to wire these into local git.
-# CI runs the equivalent path-guard regex in `.github/workflows/path-guard.yml`
-# as a required status check, so the boundary is also enforced server-side.
+# After cloning, run BOTH:
+#   pre-commit install                          # default pre-commit stage
+#   pre-commit install --hook-type commit-msg   # commit-msg stage (for no-claude-coauthor)
+#
+# CI runs path-guard server-side via .github/workflows/path-guard.yml
+# and the no-coauthor scan via .github/workflows/no-claude-coauthor.yml.
 
 repos:
   - repo: https://github.com/gitleaks/gitleaks
@@ -23,3 +29,9 @@ repos:
         language: script
         pass_filenames: false
         stages: [pre-commit]
+
+      - id: no-claude-coauthor
+        name: Block Co-Authored-By Claude trailers
+        entry: _scripts/no-claude-coauthor.sh
+        language: script
+        stages: [commit-msg]
