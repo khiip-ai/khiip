@@ -43,6 +43,38 @@ class StubEmbedder:
         return [self.embed(t) for t in texts]
 
 
+class StubHealthyXExtractor:
+    """Hermetic stand-in for XExtractor in tests that exercise /health.
+
+    The real XExtractor's health_check() pings fxtwitter, which would make
+    `test_health_no_auth_required` flake on offline CI. This stub mimics the
+    HealthCheckable Protocol contract (source + health_check returning a
+    HealthStatus) without any network. It does NOT support extraction —
+    tests that POST captures inject the dedicated StubExtractor instead.
+    """
+
+    source: str = "x"
+
+    def supports(self, url: str) -> bool:
+        return False  # this stub never claims to extract — extraction tests use StubExtractor
+
+    def extract(self, url):  # noqa: ANN001 — Protocol requires this; never called
+        raise NotImplementedError("StubHealthyXExtractor is health-probe-only")
+
+    def health_check(self):
+        from datetime import datetime, timezone
+
+        from khiip.extractors.resilience import HealthStatus
+
+        return HealthStatus(
+            source=self.source,
+            ok=True,
+            degraded_reason=None,
+            last_checked=datetime.now(timezone.utc),
+            fallback_count=2,
+        )
+
+
 @pytest.fixture
 def stub_embedder() -> StubEmbedder:
     """A fresh StubEmbedder. Inject before TestClient(app) triggers lifespan."""

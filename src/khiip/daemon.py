@@ -35,9 +35,15 @@ from khiip.config import (
 from khiip.embeddings import Embedder, MiniLMEmbedder
 from khiip.extractors import ExtractorRegistry, WebExtractor, XExtractor
 from khiip.extractors.base import CaptureData
+from khiip.extractors.resilience import (
+    ExtractorError,
+    HealthCheckable,
+    HealthStatus,
+)
 from khiip.models import (
     Capture,
     CaptureCreate,
+    ExtractorHealth,
     HealthResponse,
     RecallHit,
     RecallResponse,
@@ -178,14 +184,47 @@ def create_app() -> FastAPI:
 
     @app.get("/health", response_model=HealthResponse, tags=["meta"])
     def health() -> HealthResponse:
-        """Liveness probe. No auth required."""
+        """Liveness probe. No auth required.
+
+        Surfaces per-extractor health for sources that implement
+        `HealthCheckable`. Each implementor uses its own short-timeout probe
+        so /health doesn't block on a hung upstream. Overall status is
+        "degraded" iff any extractor reports ok=False.
+        """
         sv = storage_db.schema_version(app.state.db) if hasattr(app.state, "db") else 0
         db_path = str(app.state.config.db_path) if hasattr(app.state, "config") else ""
+
+        extractor_healths: list[ExtractorHealth] = []
+        if hasattr(app.state, "extractors"):
+            for extractor in app.state.extractors:
+                if isinstance(extractor, HealthCheckable):
+                    try:
+                        status_obj: HealthStatus = extractor.health_check()
+                        extractor_healths.append(
+                            ExtractorHealth(
+                                source=status_obj.source,
+                                ok=status_obj.ok,
+                                degraded_reason=status_obj.degraded_reason,
+                                fallback_count=status_obj.fallback_count,
+                            )
+                        )
+                    except Exception as exc:  # pragma: no cover — defensive
+                        logger.exception("health_check raised for %s", extractor.source)
+                        extractor_healths.append(
+                            ExtractorHealth(
+                                source=extractor.source,
+                                ok=False,
+                                degraded_reason=f"health_check exception: {type(exc).__name__}",
+                            )
+                        )
+
+        overall = "degraded" if any(not h.ok for h in extractor_healths) else "ok"
         return HealthResponse(
-            status="ok",
+            status=overall,
             version=__version__,
             schema_version=sv,
             db_path=db_path,
+            extractors=extractor_healths,
         )
 
     # ─────────────────────────────────────────────────────────────────
@@ -248,6 +287,16 @@ def create_app() -> FastAPI:
 
         try:
             capture_data = extractor.extract(url_str)
+        except ExtractorError as exc:
+            logger.warning(
+                "extractor fallback chain exhausted for %s: %s", url_str, exc.reason
+            )
+            headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"all upstream sources failed: {exc.reason}",
+                headers=headers,
+            ) from exc
         except httpx.HTTPError as exc:
             logger.warning("extractor upstream failure for %s: %s", url_str, exc)
             raise HTTPException(

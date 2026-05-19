@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from khiip.daemon import _compose_embed_text, create_app
 from khiip.extractors.base import CaptureData, ExtractorRegistry
 
-from .conftest import StubEmbedder
+from .conftest import StubEmbedder, StubHealthyXExtractor
 
 # ─────────────────────────────────────────────────────────────────────
 # Stub extractor — deterministic, no network
@@ -60,9 +60,23 @@ def _app_with_stub(*, fail: bool = False, embedder: StubEmbedder | None = None):
 
 
 def _bare_app():
-    """create_app() with only the embedder stubbed — preserves default extractor registry."""
+    """create_app() with embedder + X extractor stubbed — keeps /health hermetic.
+
+    XExtractor.health_check() would hit fxtwitter on every /health call
+    (flake risk on offline CI). Replace with StubHealthyXExtractor which
+    keeps the source name "x" + HealthCheckable contract but does no network.
+    WebExtractor is left as default — it doesn't implement HealthCheckable
+    so /health doesn't probe it anyway.
+    """
+    from khiip.extractors import WebExtractor
+
     app = create_app()
     app.state.embedder = StubEmbedder()
+
+    registry = ExtractorRegistry()
+    registry.register(StubHealthyXExtractor())
+    registry.register(WebExtractor())
+    app.state.extractors = registry
     return app
 
 

@@ -35,8 +35,17 @@ from urllib.parse import urlparse
 import httpx
 
 from khiip.extractors.base import CaptureData
+from khiip.extractors.resilience import (
+    FallbackFailed,
+    FallbackSource,
+    HealthStatus,
+    try_fallback_chain,
+)
 
 FXTWITTER_API = "https://api.fxtwitter.com/i/status/{tweet_id}"
+VXTWITTER_API = "https://api.vxtwitter.com/i/status/{tweet_id}"
+# A known-stable tweet ID used for liveness probes (Jack's first tweet, 2006).
+_HEALTH_PROBE_TWEET_ID = "20"
 
 # fxtwitter blocks the default `python-httpx/*` User-Agent (returns 403).
 # Identify Khiip explicitly so the upstream operator can rate-limit / contact us.
@@ -73,25 +82,131 @@ class XExtractor:
         return host in ("x.com", "www.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com") and "/status/" in url
 
     def extract(self, url: str) -> CaptureData:
-        """Fetch + parse an X URL into CaptureData via the fxtwitter API."""
+        """Fetch + parse an X URL into CaptureData via a fallback chain.
+
+        Chain: fxtwitter (primary) → vxtwitter (fallback). On both failing,
+        raises ExtractorError which the daemon maps to 502. fxtwitter's
+        rendering is richer (X-Article body blocks, views, bookmarks) so we
+        prefer it; vxtwitter loses those fields but covers the common case.
+        """
         tweet_id = _extract_tweet_id(url)
         if tweet_id is None:
             raise ValueError(f"could not extract tweet ID from URL: {url}")
 
-        payload = self._fetch_fxtwitter(tweet_id)
-        return self._parse(url, payload)
+        sources: list[FallbackSource[CaptureData]] = [
+            FallbackSource(
+                name="fxtwitter",
+                fetch_fn=lambda _u: self._fetch_and_parse_fxtwitter(url, tweet_id),
+            ),
+            FallbackSource(
+                name="vxtwitter",
+                fetch_fn=lambda _u: self._fetch_and_parse_vxtwitter(url, tweet_id),
+            ),
+        ]
+        source_name, capture_data = try_fallback_chain(sources, url)
+        # Stamp which upstream actually served us — useful for diagnostics +
+        # the future passive-tracking feature (knowing which source agreed
+        # with which engagement count matters when reconciling history).
+        capture_data.extracted_payload.setdefault("_extractor_source", source_name)
+        return capture_data
+
+    def health_check(self) -> HealthStatus:
+        """Probe fxtwitter against a known-stable tweet (jack/20).
+
+        Uses a 5s timeout regardless of the configured extract() timeout so
+        /health fails fast on a hung upstream rather than blocking the liveness
+        probe. Does not probe vxtwitter — that's the fallback by design; a
+        degraded fxtwitter signals the operator to investigate before captures
+        start visibly degrading to the thinner vxtwitter payload.
+        """
+        now = datetime.now(timezone.utc)
+        try:
+            response = self._http.get(
+                FXTWITTER_API.format(tweet_id=_HEALTH_PROBE_TWEET_ID),
+                timeout=httpx.Timeout(5.0),
+            )
+            response.raise_for_status()
+            body = response.json()
+            if not isinstance(body.get("tweet"), dict):
+                return HealthStatus(
+                    source=self.source,
+                    ok=False,
+                    degraded_reason="fxtwitter returned unexpected shape",
+                    last_checked=now,
+                    fallback_count=2,
+                )
+            return HealthStatus(
+                source=self.source,
+                ok=True,
+                last_checked=now,
+                fallback_count=2,
+            )
+        except httpx.HTTPError as exc:
+            return HealthStatus(
+                source=self.source,
+                ok=False,
+                degraded_reason=f"fxtwitter unreachable: {type(exc).__name__}",
+                last_checked=now,
+                fallback_count=2,
+            )
 
     # ─────────────────────────────────────────────────────────────────
-    # Internals
+    # Internals — fetchers (raise FallbackFailed to advance the chain)
     # ─────────────────────────────────────────────────────────────────
 
-    def _fetch_fxtwitter(self, tweet_id: str) -> dict[str, Any]:
-        """Call api.fxtwitter.com and return the parsed JSON."""
-        response = self._http.get(FXTWITTER_API.format(tweet_id=tweet_id))
-        response.raise_for_status()
-        return response.json()
+    def _fetch_and_parse_fxtwitter(
+        self, source_url: str, tweet_id: str
+    ) -> CaptureData:
+        """Try fxtwitter; raise FallbackFailed to skip to vxtwitter."""
+        try:
+            response = self._http.get(FXTWITTER_API.format(tweet_id=tweet_id))
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise FallbackFailed(
+                f"fxtwitter HTTP {exc.response.status_code}",
+                retry_after=_retry_after_seconds(exc.response),
+            ) from exc
+        except httpx.RequestError as exc:
+            raise FallbackFailed(f"fxtwitter request error: {exc}") from exc
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise FallbackFailed(f"fxtwitter returned non-JSON: {exc}") from exc
+        return self._parse_fxtwitter(source_url, payload)
 
-    def _parse(self, source_url: str, payload: dict[str, Any]) -> CaptureData:
+    def _fetch_and_parse_vxtwitter(
+        self, source_url: str, tweet_id: str
+    ) -> CaptureData:
+        """Try vxtwitter; raise FallbackFailed if it can't deliver either.
+
+        vxtwitter's response shape is flatter than fxtwitter's (top-level
+        `text`/`user_screen_name`/`date`/etc.) and loses some fields:
+        no `views`, no `bookmarks`, no X-Article body blocks. We accept
+        the thinner CaptureData as the fallback trade-off.
+        """
+        try:
+            response = self._http.get(VXTWITTER_API.format(tweet_id=tweet_id))
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise FallbackFailed(
+                f"vxtwitter HTTP {exc.response.status_code}",
+                retry_after=_retry_after_seconds(exc.response),
+            ) from exc
+        except httpx.RequestError as exc:
+            raise FallbackFailed(f"vxtwitter request error: {exc}") from exc
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise FallbackFailed(f"vxtwitter returned non-JSON: {exc}") from exc
+        return self._parse_vxtwitter(source_url, payload)
+
+    # ─────────────────────────────────────────────────────────────────
+    # Internals — parsers (per-source response shape → CaptureData)
+    # ─────────────────────────────────────────────────────────────────
+
+    def _parse_fxtwitter(
+        self, source_url: str, payload: dict[str, Any]
+    ) -> CaptureData:
         """Parse fxtwitter JSON into CaptureData."""
         tweet = payload.get("tweet") or {}
         author = tweet.get("author") or {}
@@ -125,10 +240,126 @@ class XExtractor:
             media_paths=[],  # TODO: download media via gallery-dl
         )
 
+    def _parse_vxtwitter(
+        self, source_url: str, payload: dict[str, Any]
+    ) -> CaptureData:
+        """Parse vxtwitter JSON into CaptureData.
+
+        vxtwitter response shape (flatter than fxtwitter; top-level fields):
+          { user_name, user_screen_name, text, likes, retweets, replies,
+            qrtCount, date, mediaURLs, communityNote, qrt, ... }
+        Missing vs fxtwitter: `views`, `bookmarks`, X-Article body blocks,
+        nested author metadata. The trade-off is documented at the call site.
+        """
+        text = payload.get("text") or ""
+        screen_name = payload.get("user_screen_name")
+        display_name = payload.get("user_name")
+
+        recorded_at = datetime.now(timezone.utc)
+        valid_from = _parse_iso(payload.get("date")) or recorded_at
+
+        engagement = _parse_vxtwitter_engagement(payload)
+        body_markdown = _render_vxtwitter_body(payload)
+
+        # Title synthesis: vxtwitter has no `article` block, so fall through
+        # to text-first then author-fallback.
+        title = _synthesize_title(
+            article=None,
+            text=text,
+            author=display_name or screen_name,
+            quote_author=(payload.get("qrt") or {}).get("user_screen_name")
+            if isinstance(payload.get("qrt"), dict)
+            else None,
+        )
+
+        return CaptureData(
+            source="x",
+            source_url=source_url,
+            recorded_at=recorded_at,
+            valid_from=valid_from,
+            title=title,
+            description=text,
+            author=screen_name,
+            body_markdown=body_markdown,
+            extracted_payload=payload,
+            engagement_at_capture=engagement or None,
+            media_paths=[],
+        )
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Module helpers
 # ─────────────────────────────────────────────────────────────────────
+
+
+def _retry_after_seconds(response: httpx.Response | None) -> int | None:
+    """Parse the Retry-After header into seconds (int) if present + valid."""
+    if response is None:
+        return None
+    header = response.headers.get("Retry-After")
+    if not header:
+        return None
+    try:
+        return int(header)
+    except ValueError:
+        return None  # HTTP-date form not handled in v0; rare in API responses
+
+
+def _parse_vxtwitter_engagement(payload: dict[str, Any]) -> dict[str, int]:
+    """Map vxtwitter's flat engagement fields to Khiip's engagement dict.
+
+    vxtwitter exposes likes / retweets / replies / qrtCount. No views, no
+    bookmarks (those are X.com-internal counters fxtwitter scrapes from
+    a different endpoint). We expose what's available.
+    """
+    mapping = {
+        "likes": "likes",
+        "retweets": "retweets",
+        "replies": "replies",
+        "qrtCount": "quotes",
+    }
+    result: dict[str, int] = {}
+    for src, dst in mapping.items():
+        v = payload.get(src)
+        if isinstance(v, int):
+            result[dst] = v
+    return result
+
+
+def _render_vxtwitter_body(payload: dict[str, Any]) -> str:
+    """Compose markdown body from vxtwitter payload.
+
+    Sections (in order, skipped if absent):
+    1. Main tweet text
+    2. Media URLs (rendered as `![media](url)` lines)
+    3. Community note (vxtwitter: `communityNote.text` if present)
+    4. QRT blockquote (if `qrt` present)
+    """
+    parts: list[str] = []
+
+    text = payload.get("text")
+    if text:
+        parts.append(text)
+
+    media_urls = payload.get("mediaURLs") or []
+    if isinstance(media_urls, list) and media_urls:
+        parts.append("\n".join(f"![media]({u})" for u in media_urls if isinstance(u, str)))
+
+    note = payload.get("communityNote")
+    if isinstance(note, dict):
+        note_text = note.get("text")
+        if note_text:
+            parts.append(f"> **Community note:** {note_text}")
+
+    qrt = payload.get("qrt")
+    if isinstance(qrt, dict):
+        qrt_author = qrt.get("user_screen_name")
+        qrt_text = qrt.get("text") or ""
+        header = f"> Quoting @{qrt_author}:" if qrt_author else "> Quoting:"
+        body = "\n".join(f"> {line}" for line in qrt_text.splitlines() if line)
+        parts.append(f"{header}\n{body}" if body else header)
+
+    return "\n\n".join(parts)
 
 
 def _extract_tweet_id(url: str) -> str | None:

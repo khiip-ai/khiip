@@ -154,11 +154,23 @@ class RecallResponse(BaseModel):
 # ───────────────────────────────────────────────────────────────────────────
 
 
+class ExtractorHealth(BaseModel):
+    """One row of /health's `extractors` block — per-source liveness."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str
+    ok: bool
+    degraded_reason: str | None = None
+    fallback_count: int | None = None
+
+
 class HealthResponse(BaseModel):
-    status: Literal["ok"]
+    status: Literal["ok", "degraded"]
     version: str
     schema_version: int
     db_path: str
+    extractors: list[ExtractorHealth] = Field(default_factory=list)
 
 
 __all__ = [
@@ -169,6 +181,7 @@ __all__ = [
     "Edge",
     "EdgeCreate",
     "EdgeType",
+    "ExtractorHealth",
     "HealthResponse",
     "RecallHit",
     "RecallResponse",

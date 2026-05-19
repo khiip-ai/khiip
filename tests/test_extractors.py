@@ -260,7 +260,7 @@ def test_xextractor_parse_returns_capture_data() -> None:
         }
     }
     ex = XExtractor(http_client=MagicMock(spec=httpx.Client))
-    cap = ex._parse("https://x.com/namcios/status/2053257337746657561", payload)
+    cap = ex._parse_fxtwitter("https://x.com/namcios/status/2053257337746657561", payload)
 
     assert isinstance(cap, CaptureData)
     assert cap.source == "x"
@@ -285,7 +285,7 @@ def test_xextractor_parse_handles_missing_engagement() -> None:
     """If engagement fields are absent, engagement_at_capture is None (not empty dict)."""
     payload = {"tweet": {"text": "minimal", "author": {"screen_name": "u"}}}
     ex = XExtractor(http_client=MagicMock(spec=httpx.Client))
-    cap = ex._parse("https://x.com/u/status/1", payload)
+    cap = ex._parse_fxtwitter("https://x.com/u/status/1", payload)
     assert cap.engagement_at_capture is None
 
 
@@ -303,7 +303,7 @@ def test_xextractor_parse_qrt_marks_title_and_embeds_quote() -> None:
         }
     }
     ex = XExtractor(http_client=MagicMock(spec=httpx.Client))
-    cap = ex._parse("https://x.com/me/status/9", payload)
+    cap = ex._parse_fxtwitter("https://x.com/me/status/9", payload)
     assert cap.title is not None
     assert cap.title.endswith("(QRT @alice)")
     assert "**Quoting [@alice]" in cap.body_markdown
@@ -329,7 +329,7 @@ def test_xextractor_parse_article_uses_article_title_and_renders_blocks() -> Non
         }
     }
     ex = XExtractor(http_client=MagicMock(spec=httpx.Client))
-    cap = ex._parse("https://x.com/essayist/status/100", payload)
+    cap = ex._parse_fxtwitter("https://x.com/essayist/status/100", payload)
     assert cap.title == "A Long Essay"
     assert "# A Long Essay" in cap.body_markdown
     assert "## Section 1" in cap.body_markdown
@@ -531,3 +531,252 @@ def test_registry_order_x_claims_x_urls_web_claims_others() -> None:
     found_web = registry.find("https://example.com/article")
     assert found_web is not None
     assert found_web.source == "web"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Resilience primitives — try_fallback_chain, ExtractorError, HealthStatus
+# ─────────────────────────────────────────────────────────────────────
+
+from khiip.extractors.resilience import (
+    ExtractorError,
+    FallbackFailed,
+    FallbackSource,
+    HealthCheckable,
+    HealthStatus,
+    try_fallback_chain,
+)
+
+
+def test_try_fallback_chain_first_succeeds():
+    calls = []
+
+    def ok1(target):
+        calls.append("a"); return f"from-a:{target}"
+
+    def ok2(target):
+        calls.append("b"); return f"from-b:{target}"
+
+    sources = [FallbackSource("a", ok1), FallbackSource("b", ok2)]
+    name, result = try_fallback_chain(sources, "T")
+    assert name == "a"
+    assert result == "from-a:T"
+    assert calls == ["a"]  # second source not called
+
+
+def test_try_fallback_chain_falls_to_second():
+    def fail1(target):
+        raise FallbackFailed("a is down")
+
+    def ok2(target):
+        return f"from-b:{target}"
+
+    sources = [FallbackSource("a", fail1), FallbackSource("b", ok2)]
+    name, result = try_fallback_chain(sources, "T")
+    assert name == "b"
+    assert result == "from-b:T"
+
+
+def test_try_fallback_chain_all_fail_raises_extractor_error():
+    sources = [
+        FallbackSource("a", lambda t: (_ for _ in ()).throw(FallbackFailed("a down"))),
+        FallbackSource("b", lambda t: (_ for _ in ()).throw(FallbackFailed("b down"))),
+    ]
+    with pytest.raises(ExtractorError) as info:
+        try_fallback_chain(sources, "T")
+    assert "a down" in info.value.reason
+    assert "b down" in info.value.reason
+
+
+def test_try_fallback_chain_propagates_retry_after_from_last_failure():
+    sources = [
+        FallbackSource(
+            "a",
+            lambda t: (_ for _ in ()).throw(FallbackFailed("a 429", retry_after=30)),
+        ),
+        FallbackSource(
+            "b",
+            lambda t: (_ for _ in ()).throw(FallbackFailed("b 429", retry_after=60)),
+        ),
+    ]
+    with pytest.raises(ExtractorError) as info:
+        try_fallback_chain(sources, "T")
+    assert info.value.retry_after == 60
+
+
+def test_try_fallback_chain_empty_raises():
+    with pytest.raises(ExtractorError):
+        try_fallback_chain([], "T")
+
+
+def test_try_fallback_chain_non_fallback_exception_propagates():
+    """A TypeError inside a fetch_fn is a bug — not a fallback signal — and propagates."""
+
+    def buggy(target):
+        raise TypeError("misuse")
+
+    def ok_after(target):
+        return "wont be called"
+
+    with pytest.raises(TypeError):
+        try_fallback_chain(
+            [FallbackSource("buggy", buggy), FallbackSource("ok", ok_after)], "T"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# XExtractor — fallback chain integration
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _stub_fxtwitter_payload(tweet_text="hello world", screen_name="jack"):
+    return {
+        "tweet": {
+            "text": tweet_text,
+            "author": {"name": "Jack", "screen_name": screen_name},
+            "created_at": "Mon, 18 May 2026 17:26:00 GMT",
+            "likes": 5, "retweets": 2, "replies": 1, "views": 100, "bookmarks": 3,
+        }
+    }
+
+
+def _stub_vxtwitter_payload(tweet_text="hello world", screen_name="jack"):
+    return {
+        "text": tweet_text,
+        "user_name": "Jack",
+        "user_screen_name": screen_name,
+        "date": "Mon, 18 May 2026 17:26:00 GMT",
+        "likes": 5, "retweets": 2, "replies": 1, "qrtCount": 0,
+        "mediaURLs": [],
+    }
+
+
+def test_xextractor_fxtwitter_succeeds_vxtwitter_not_called():
+    """Happy path: fxtwitter returns 200; vxtwitter never called."""
+    fx_response = MagicMock(spec=httpx.Response)
+    fx_response.raise_for_status = MagicMock()
+    fx_response.json = MagicMock(return_value=_stub_fxtwitter_payload())
+
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=fx_response)
+
+    cap = XExtractor(http_client=client).extract("https://x.com/jack/status/20")
+    assert cap.source == "x"
+    assert cap.author == "jack"
+    assert client.get.call_count == 1  # only fxtwitter
+    assert "fxtwitter" in client.get.call_args[0][0]
+    assert cap.extracted_payload.get("_extractor_source") == "fxtwitter"
+
+
+def test_xextractor_fxtwitter_404_falls_to_vxtwitter():
+    """fxtwitter 404 → fall through to vxtwitter, which returns 200."""
+    fx_error_response = MagicMock()
+    fx_error_response.status_code = 404
+    fx_error_response.headers = {}
+
+    fx_response = MagicMock(spec=httpx.Response)
+    fx_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError("404", request=MagicMock(), response=fx_error_response)
+    )
+
+    vx_response = MagicMock(spec=httpx.Response)
+    vx_response.raise_for_status = MagicMock()
+    vx_response.json = MagicMock(return_value=_stub_vxtwitter_payload())
+
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(side_effect=[fx_response, vx_response])
+
+    cap = XExtractor(http_client=client).extract("https://x.com/jack/status/20")
+    assert cap.source == "x"
+    assert cap.author == "jack"
+    assert client.get.call_count == 2
+    assert "fxtwitter" in client.get.call_args_list[0][0][0]
+    assert "vxtwitter" in client.get.call_args_list[1][0][0]
+    assert cap.extracted_payload.get("_extractor_source") == "vxtwitter"
+
+
+def test_xextractor_both_sources_fail_raises_extractor_error():
+    """Both upstreams 404 → ExtractorError surfaces both reasons; daemon → 502."""
+    fx_error_response = MagicMock(); fx_error_response.status_code = 404; fx_error_response.headers = {}
+    vx_error_response = MagicMock(); vx_error_response.status_code = 503; vx_error_response.headers = {"Retry-After": "30"}
+
+    fx_response = MagicMock(spec=httpx.Response)
+    fx_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError("404", request=MagicMock(), response=fx_error_response)
+    )
+
+    vx_response = MagicMock(spec=httpx.Response)
+    vx_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError("503", request=MagicMock(), response=vx_error_response)
+    )
+
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(side_effect=[fx_response, vx_response])
+
+    with pytest.raises(ExtractorError) as info:
+        XExtractor(http_client=client).extract("https://x.com/u/status/123")
+    assert "fxtwitter" in info.value.reason
+    assert "vxtwitter" in info.value.reason
+    assert info.value.retry_after == 30  # propagated from vxtwitter (last failure)
+
+
+def test_xextractor_health_check_ok_when_fxtwitter_returns_tweet():
+    response = MagicMock(spec=httpx.Response)
+    response.raise_for_status = MagicMock()
+    response.json = MagicMock(return_value=_stub_fxtwitter_payload())
+
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=response)
+
+    status_obj = XExtractor(http_client=client).health_check()
+    assert status_obj.source == "x"
+    assert status_obj.ok is True
+    assert status_obj.degraded_reason is None
+    assert status_obj.fallback_count == 2
+
+
+def test_xextractor_health_check_degraded_on_fxtwitter_5xx():
+    error_response = MagicMock(); error_response.status_code = 503; error_response.headers = {}
+    response = MagicMock(spec=httpx.Response)
+    response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError("503", request=MagicMock(), response=error_response)
+    )
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=response)
+
+    status_obj = XExtractor(http_client=client).health_check()
+    assert status_obj.ok is False
+    assert "HTTPStatusError" in status_obj.degraded_reason
+
+
+def test_xextractor_health_check_degraded_on_unexpected_shape():
+    """fxtwitter returns 200 but missing the `tweet` key (catalog drift)."""
+    response = MagicMock(spec=httpx.Response)
+    response.raise_for_status = MagicMock()
+    response.json = MagicMock(return_value={"error": "Not Found"})
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=response)
+
+    status_obj = XExtractor(http_client=client).health_check()
+    assert status_obj.ok is False
+    assert "unexpected shape" in status_obj.degraded_reason
+
+
+def test_xextractor_is_health_checkable_protocol():
+    """XExtractor satisfies the HealthCheckable Protocol — runtime check."""
+    assert isinstance(XExtractor(), HealthCheckable)
+
+
+def test_webextractor_is_not_health_checkable():
+    """WebExtractor doesn't (yet) implement health_check — opt-in design."""
+    assert not isinstance(WebExtractor(), HealthCheckable)
+
+
+def test_xextractor_parse_vxtwitter_extracts_fields():
+    """vxtwitter parser handles the flatter response shape."""
+    cap = XExtractor()._parse_vxtwitter(
+        "https://x.com/jack/status/20", _stub_vxtwitter_payload()
+    )
+    assert cap.source == "x"
+    assert cap.author == "jack"
+    assert cap.description == "hello world"
+    assert cap.engagement_at_capture == {"likes": 5, "retweets": 2, "replies": 1, "quotes": 0}
