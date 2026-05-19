@@ -359,7 +359,7 @@ def create_app() -> FastAPI:
             logger.exception("embedder failed on recall query")
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=f"embedder unavailable: {exc}",
+                detail="embedder unavailable",
             ) from exc
 
         ranked = embeddings_store.cosine_topk(query_vector, records, limit=limit)

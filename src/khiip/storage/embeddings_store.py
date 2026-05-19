@@ -124,6 +124,9 @@ def cosine_topk(
     safe_norms = np.where(norms == 0.0, 1.0, norms)
     matrix = matrix / safe_norms[:, None]
     scores = matrix @ q
+    # float32 dot products can drift ±1e-7 outside [-1, 1] for near-identical vectors;
+    # clamp so callers (e.g. Pydantic-bounded RecallHit.score) see a strict cosine range.
+    scores = np.clip(scores, -1.0, 1.0)
     scores = np.where(valid, scores, -np.inf)
 
     n_valid = int(valid.sum())
