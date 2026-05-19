@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import httpx
 import pytest
 
 from khiip.extractors.base import CaptureData, ExtractorRegistry
-from khiip.extractors.x import XExtractor, _extract_tweet_id, _parse_iso, _synthesize_title
-
+from khiip.extractors.x import (
+    XExtractor,
+    _extract_tweet_id,
+    _parse_engagement,
+    _parse_iso,
+    _render_article,
+    _render_body,
+    _render_community_note,
+    _render_media,
+    _render_quote,
+    _render_reply_header,
+    _synthesize_title,
+)
 
 # ─────────────────────────────────────────────────────────────────────
 # XExtractor.supports — URL pattern matching
@@ -58,24 +68,179 @@ def test_extract_tweet_id_returns_none_on_no_match() -> None:
 
 def test_synthesize_title_uses_first_line() -> None:
     text = "First line of the tweet.\nSecond line goes here."
-    assert _synthesize_title(text, "alice") == "First line of the tweet."
+    assert _synthesize_title(article=None, text=text, author="alice") == "First line of the tweet."
 
 
 def test_synthesize_title_truncates_long() -> None:
-    text = "x" * 200
-    title = _synthesize_title(text, "alice")
+    title = _synthesize_title(article=None, text="x" * 200, author="alice")
     assert title is not None
     assert len(title) <= 80
     assert title.endswith("...")
 
 
 def test_synthesize_title_falls_back_to_author() -> None:
-    assert _synthesize_title(None, "alice") == "tweet by alice"
-    assert _synthesize_title("", "alice") == "tweet by alice"
+    assert _synthesize_title(article=None, text=None, author="alice") == "tweet by alice"
+    assert _synthesize_title(article=None, text="", author="alice") == "tweet by alice"
+
+
+def test_synthesize_title_prefers_article_title() -> None:
+    article = {"title": "On Distillation"}
+    title = _synthesize_title(article=article, text="text we ignore", author="alice")
+    assert title == "On Distillation"
+
+
+def test_synthesize_title_marks_qrt() -> None:
+    title = _synthesize_title(article=None, text="my hot take", author="me", quote_author="bob")
+    assert title == "my hot take (QRT @bob)"
 
 
 # ─────────────────────────────────────────────────────────────────────
-# XExtractor._parse — fxtwitter JSON shape
+# _parse_engagement
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_parse_engagement_includes_quotes() -> None:
+    """`quotes` was missing in the prior pass — confirm it lands now."""
+    eng = _parse_engagement(
+        {"likes": 10, "retweets": 5, "replies": 3, "views": 100, "bookmarks": 2, "quotes": 7}
+    )
+    assert eng == {"likes": 10, "retweets": 5, "replies": 3, "views": 100, "bookmarks": 2, "quotes": 7}
+
+
+def test_parse_engagement_skips_non_int() -> None:
+    """views is sometimes null (e.g. jack/20); coerce-skip rather than 0-fill."""
+    eng = _parse_engagement({"likes": 10, "views": None, "bookmarks": "junk"})
+    assert eng == {"likes": 10}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Body sub-renderers
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_render_reply_header_with_status() -> None:
+    h = _render_reply_header({"replying_to": "alice", "replying_to_status": "12345"})
+    assert h == "_In reply to_ [@alice](https://x.com/alice/status/12345)"
+
+
+def test_render_reply_header_without_status() -> None:
+    h = _render_reply_header({"replying_to": "alice"})
+    assert h == "_In reply to_ @alice"
+
+
+def test_render_reply_header_none_when_not_a_reply() -> None:
+    assert _render_reply_header({"replying_to": None}) is None
+    assert _render_reply_header({}) is None
+
+
+def test_render_media_renders_photos_and_videos() -> None:
+    media = {
+        "all": [
+            {"type": "photo", "url": "https://pbs.twimg.com/media/a.jpg"},
+            {"type": "video", "url": "https://video.twimg.com/v/b.mp4"},
+            {"type": "photo", "url": "https://pbs.twimg.com/media/c.jpg"},
+        ]
+    }
+    md = _render_media(media)
+    assert md is not None
+    assert "![](https://pbs.twimg.com/media/a.jpg)" in md
+    assert "[video 1](https://video.twimg.com/v/b.mp4)" in md
+    assert "![](https://pbs.twimg.com/media/c.jpg)" in md
+
+
+def test_render_media_tolerates_legacy_summary_shape() -> None:
+    """Older fxtwitter responses sometimes used {all: int}; treat as empty."""
+    assert _render_media({"all": 1, "videos": 1}) is None
+    assert _render_media(None) is None
+    assert _render_media({}) is None
+
+
+def test_render_community_note_renders_as_blockquote() -> None:
+    note = {"text": "This is misleading.\nSee correction."}
+    md = _render_community_note(note)
+    assert md is not None
+    assert "**Community Note:**" in md
+    assert "> This is misleading." in md
+    assert "> See correction." in md
+
+
+def test_render_community_note_none_when_absent() -> None:
+    assert _render_community_note(None) is None
+    assert _render_community_note({"text": ""}) is None
+
+
+def test_render_quote_renders_as_attributed_blockquote() -> None:
+    quote = {
+        "author": {"screen_name": "alice"},
+        "text": "Original tweet\nsecond line.",
+        "url": "https://x.com/alice/status/42",
+    }
+    md = _render_quote(quote)
+    assert md is not None
+    assert "**Quoting [@alice](https://x.com/alice/status/42):**" in md
+    assert "> Original tweet" in md
+    assert "> second line." in md
+
+
+def test_render_quote_none_when_no_quote() -> None:
+    assert _render_quote(None) is None
+    assert _render_quote({"author": {"screen_name": "alice"}}) is None  # no text + no url
+
+
+def test_render_article_renders_blocks() -> None:
+    article = {
+        "title": "On Distillation",
+        "subtitle": "and what it reveals",
+        "content": {
+            "blocks": [
+                {"type": "heading", "text": "Intro", "depth": 2},
+                {"type": "paragraph", "text": "First paragraph."},
+                {"type": "list", "items": ["a", "b", "c"], "ordered": False},
+                {"type": "image", "url": "https://pbs.twimg.com/article/img.jpg"},
+                {"type": "quote", "text": "an inline quote"},
+            ]
+        },
+    }
+    md = _render_article(article)
+    assert "# On Distillation" in md
+    assert "_and what it reveals_" in md
+    assert "## Intro" in md
+    assert "First paragraph." in md
+    assert "- a\n- b\n- c" in md
+    assert "![](https://pbs.twimg.com/article/img.jpg)" in md
+    assert "> an inline quote" in md
+
+
+def test_render_body_simple_tweet_returns_text_only() -> None:
+    """Plain tweet with no reply/quote/media/article composes to just the text."""
+    tweet = {"text": "just setting up my twttr"}
+    assert _render_body(tweet) == "just setting up my twttr"
+
+
+def test_render_body_composes_all_sections() -> None:
+    """Full tweet with reply context + media + community note + QRT all surface in body."""
+    tweet = {
+        "text": "agree",
+        "replying_to": "alice",
+        "replying_to_status": "1",
+        "media": {"all": [{"type": "photo", "url": "https://pbs.twimg.com/x.jpg"}]},
+        "community_note": {"text": "context here"},
+        "quote": {
+            "author": {"screen_name": "bob"},
+            "text": "what bob said",
+            "url": "https://x.com/bob/status/2",
+        },
+    }
+    body = _render_body(tweet)
+    assert "_In reply to_" in body
+    assert "agree" in body
+    assert "![](https://pbs.twimg.com/x.jpg)" in body
+    assert "**Community Note:**" in body
+    assert "**Quoting [@bob]" in body
+
+
+# ─────────────────────────────────────────────────────────────────────
+# XExtractor._parse — full fxtwitter payload shape
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -91,7 +256,7 @@ def test_xextractor_parse_returns_capture_data() -> None:
             "replies": 168,
             "views": 1161874,
             "bookmarks": 4749,
-            "media": {"all": 1, "videos": 1},
+            "quotes": 89,
         }
     }
     ex = XExtractor(http_client=MagicMock(spec=httpx.Client))
@@ -110,6 +275,7 @@ def test_xextractor_parse_returns_capture_data() -> None:
         "replies": 168,
         "views": 1161874,
         "bookmarks": 4749,
+        "quotes": 89,
     }
     assert cap.extracted_payload == payload
     assert cap.media_paths == []
@@ -121,6 +287,53 @@ def test_xextractor_parse_handles_missing_engagement() -> None:
     ex = XExtractor(http_client=MagicMock(spec=httpx.Client))
     cap = ex._parse("https://x.com/u/status/1", payload)
     assert cap.engagement_at_capture is None
+
+
+def test_xextractor_parse_qrt_marks_title_and_embeds_quote() -> None:
+    """A QRT'd tweet renders the quote inline and tags the title."""
+    payload = {
+        "tweet": {
+            "text": "+1 to this",
+            "author": {"screen_name": "me", "name": "Me"},
+            "quote": {
+                "author": {"screen_name": "alice"},
+                "text": "great point",
+                "url": "https://x.com/alice/status/1",
+            },
+        }
+    }
+    ex = XExtractor(http_client=MagicMock(spec=httpx.Client))
+    cap = ex._parse("https://x.com/me/status/9", payload)
+    assert cap.title is not None
+    assert cap.title.endswith("(QRT @alice)")
+    assert "**Quoting [@alice]" in cap.body_markdown
+    assert "> great point" in cap.body_markdown
+
+
+def test_xextractor_parse_article_uses_article_title_and_renders_blocks() -> None:
+    """Long-form tweets with an article use article.title + block render."""
+    payload = {
+        "tweet": {
+            "text": "fallback text the parser should ignore for body",
+            "author": {"screen_name": "essayist"},
+            "is_note_tweet": True,
+            "article": {
+                "title": "A Long Essay",
+                "content": {
+                    "blocks": [
+                        {"type": "heading", "text": "Section 1", "depth": 2},
+                        {"type": "paragraph", "text": "Hello world."},
+                    ]
+                },
+            },
+        }
+    }
+    ex = XExtractor(http_client=MagicMock(spec=httpx.Client))
+    cap = ex._parse("https://x.com/essayist/status/100", payload)
+    assert cap.title == "A Long Essay"
+    assert "# A Long Essay" in cap.body_markdown
+    assert "## Section 1" in cap.body_markdown
+    assert "Hello world." in cap.body_markdown
 
 
 # ─────────────────────────────────────────────────────────────────────

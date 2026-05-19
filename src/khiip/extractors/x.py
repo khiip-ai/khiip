@@ -7,17 +7,22 @@ bookmark + quote counts. Test 1 measured: 42,675 bytes structured JSON
 (fxtwitter) vs 2,625 bytes flat markdown (Jina Reader) — 16× capture-depth
 gap that motivates this extractor.
 
-**v0 Week 1 scope (this scaffold):**
-- URL parser → extract tweet ID
-- fxtwitter HTTP call → JSON
-- Parse top-level fields into CaptureData
-- TODO markers for QRT chain expansion + X-Article body + media download
+**Current scope (this pass):**
+- URL parser → tweet ID
+- fxtwitter HTTP call → JSON (sends khiip UA; default httpx UA is 403'd)
+- Body composition (in order):
+    1. Reply-context header (`replying_to` + `replying_to_status`)
+    2. Main tweet text (or article content blocks if `tweet.article`)
+    3. Media (photos as `![](url)`, videos as `[video N](url)`)
+    4. Community note (if present)
+    5. QRT blockquote (one level deep)
+- Engagement snapshot — likes/retweets/replies/views/bookmarks/quotes
+- `extracted_payload` preserves the verbatim fxtwitter JSON
 
-**Deferred to next implementation pass:**
-- gallery-dl integration for media binaries (per ADR-0007 capture pipeline)
-- QRT chain depth handling
-- X-Article block-level parsing (108-block render from fxtwitter `quote.article.content.blocks`)
-- engagement_at_capture snapshot extraction (views / bookmarks / quotes)
+**Deferred to next pass:**
+- gallery-dl integration for media binaries → populate `media_paths`
+- Recursive QRT depth >1 (current scaffold renders one level)
+- Article inline media blocks (currently rendered as `[image N]` placeholder)
 """
 
 from __future__ import annotations
@@ -29,7 +34,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from khiip.extractors.base import CaptureData, Extractor
+from khiip.extractors.base import CaptureData
 
 FXTWITTER_API = "https://api.fxtwitter.com/i/status/{tweet_id}"
 
@@ -39,6 +44,9 @@ _USER_AGENT = "khiip-daemon/0.0.1 (+https://github.com/khiip-ai/khiip)"
 
 # X URL patterns: x.com/{user}/status/{id} or twitter.com/{user}/status/{id}
 _TWEET_ID_PATTERN = re.compile(r"/status/(\d+)")
+
+# Engagement keys we capture from a tweet (or its quote)
+_ENGAGEMENT_KEYS = ("likes", "retweets", "replies", "views", "bookmarks", "quotes")
 
 
 class XExtractor:
@@ -84,40 +92,34 @@ class XExtractor:
         return response.json()
 
     def _parse(self, source_url: str, payload: dict[str, Any]) -> CaptureData:
-        """Parse fxtwitter JSON into CaptureData. v0 Week 1 scope: top-level fields only."""
+        """Parse fxtwitter JSON into CaptureData."""
         tweet = payload.get("tweet") or {}
         author = tweet.get("author") or {}
-        media = tweet.get("media") or {}
 
         recorded_at = datetime.now(timezone.utc)
         valid_from = _parse_iso(tweet.get("created_at")) or recorded_at
 
-        # Engagement snapshot per v0 spec D8 — captured at save time
-        engagement = {
-            k: int(v)
-            for k, v in {
-                "likes": tweet.get("likes"),
-                "retweets": tweet.get("retweets"),
-                "replies": tweet.get("replies"),
-                "views": tweet.get("views"),
-                "bookmarks": tweet.get("bookmarks"),
-            }.items()
-            if isinstance(v, int)
-        }
+        engagement = _parse_engagement(tweet)
+        quote = tweet.get("quote") if isinstance(tweet.get("quote"), dict) else None
 
-        # TODO: full QRT chain expansion + X-Article body parsing + media download
-        # For Week 1 scaffold: include the raw fxtwitter payload in extracted_payload
-        # so downstream consumers can re-parse without re-fetching.
+        body_markdown = _render_body(tweet)
+
+        title = _synthesize_title(
+            article=tweet.get("article"),
+            text=tweet.get("text"),
+            author=author.get("name") or author.get("screen_name"),
+            quote_author=(quote or {}).get("author", {}).get("screen_name") if quote else None,
+        )
 
         return CaptureData(
             source="x",
             source_url=source_url,
             recorded_at=recorded_at,
             valid_from=valid_from,
-            title=_synthesize_title(tweet.get("text"), author.get("name") or author.get("screen_name")),
+            title=title,
             description=tweet.get("text"),
             author=author.get("screen_name"),
-            body_markdown=tweet.get("text", ""),
+            body_markdown=body_markdown,
             extracted_payload=payload,
             engagement_at_capture=engagement or None,
             media_paths=[],  # TODO: download media via gallery-dl
@@ -153,14 +155,203 @@ def _parse_iso(value: str | None) -> datetime | None:
             return None
 
 
-def _synthesize_title(text: str | None, author: str | None) -> str | None:
-    """Build a short title for the capture filename slug."""
-    if not text:
-        return f"tweet by {author}" if author else None
-    first_line = text.splitlines()[0]
-    if len(first_line) > 80:
-        first_line = first_line[:77].rstrip() + "..."
-    return first_line
+def _parse_engagement(tweet: dict[str, Any]) -> dict[str, int]:
+    """Extract per-v0-spec engagement snapshot, coercing non-int values to skip."""
+    return {
+        k: int(tweet[k])
+        for k in _ENGAGEMENT_KEYS
+        if isinstance(tweet.get(k), int)
+    }
+
+
+def _synthesize_title(
+    *,
+    article: dict[str, Any] | None,
+    text: str | None,
+    author: str | None,
+    quote_author: str | None = None,
+) -> str | None:
+    """Build a short title for the capture filename slug.
+
+    Priority: article title (long-form posts) > first text line > author fallback.
+    QRTs get a `(QRT @author)` suffix so they're distinguishable in the vault.
+    """
+    if isinstance(article, dict) and article.get("title"):
+        base = str(article["title"]).strip()
+    elif text:
+        base = text.splitlines()[0]
+    elif author:
+        base = f"tweet by {author}"
+    else:
+        return None
+
+    if quote_author:
+        base = f"{base} (QRT @{quote_author})"
+
+    if len(base) > 80:
+        base = base[:77].rstrip() + "..."
+    return base
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Body rendering — composes markdown from tweet sub-structures
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _render_body(tweet: dict[str, Any]) -> str:
+    """Compose the full markdown body for the captured tweet."""
+    parts: list[str] = []
+
+    reply_header = _render_reply_header(tweet)
+    if reply_header:
+        parts.append(reply_header)
+
+    article = tweet.get("article")
+    if isinstance(article, dict):
+        parts.append(_render_article(article))
+    elif tweet.get("text"):
+        parts.append(str(tweet["text"]))
+
+    media_md = _render_media(tweet.get("media"))
+    if media_md:
+        parts.append(media_md)
+
+    note_md = _render_community_note(tweet.get("community_note"))
+    if note_md:
+        parts.append(note_md)
+
+    quote_md = _render_quote(tweet.get("quote"))
+    if quote_md:
+        parts.append(quote_md)
+
+    return "\n\n".join(parts)
+
+
+def _render_reply_header(tweet: dict[str, Any]) -> str | None:
+    """Render `In reply to @author (status/id)` header when this tweet is a reply."""
+    parent_author = tweet.get("replying_to")
+    parent_status = tweet.get("replying_to_status")
+    if not parent_author:
+        return None
+    if parent_status:
+        return f"_In reply to_ [@{parent_author}](https://x.com/{parent_author}/status/{parent_status})"
+    return f"_In reply to_ @{parent_author}"
+
+
+def _render_media(media: Any) -> str | None:
+    """Render media block from `tweet.media.all[]`.
+
+    Photos → `![](url)`. Videos → `[video N](url)`. Returns None when no media.
+    Defensive against the older fxtwitter summary shape (`{all: int}`) where
+    `media.all` is an integer count rather than a list — those payloads
+    pre-date the structured response and are treated as empty.
+    """
+    if not isinstance(media, dict):
+        return None
+    items = media.get("all")
+    if not isinstance(items, list) or not items:
+        return None
+
+    lines: list[str] = []
+    video_idx = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url")
+        if not isinstance(url, str):
+            continue
+        kind = item.get("type")
+        if kind == "video" or kind == "gif":
+            video_idx += 1
+            lines.append(f"[video {video_idx}]({url})")
+        else:
+            lines.append(f"![]({url})")
+    return "\n\n".join(lines) if lines else None
+
+
+def _render_community_note(note: Any) -> str | None:
+    """Render a Birdwatch / Community Note as a blockquote."""
+    if not isinstance(note, dict):
+        return None
+    text = note.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    quoted = "\n".join(f"> {line}" for line in text.splitlines())
+    return f"**Community Note:**\n\n{quoted}"
+
+
+def _render_quote(quote: Any) -> str | None:
+    """Render a QRT'd tweet as an attributed blockquote (one level deep)."""
+    if not isinstance(quote, dict):
+        return None
+    author = (quote.get("author") or {}).get("screen_name") or "unknown"
+    text = quote.get("text") or ""
+    url = quote.get("url") or ""
+    if not text and not url:
+        return None
+
+    quoted = "\n".join(f"> {line}" for line in text.splitlines()) if text else "> _(no text)_"
+    header = f"**Quoting [@{author}]({url}):**" if url else f"**Quoting @{author}:**"
+    return f"{header}\n\n{quoted}"
+
+
+def _render_article(article: dict[str, Any]) -> str:
+    """Render an X-Article's title + block content into markdown."""
+    lines: list[str] = []
+    title = article.get("title")
+    if isinstance(title, str) and title.strip():
+        lines.append(f"# {title.strip()}")
+    subtitle = article.get("subtitle")
+    if isinstance(subtitle, str) and subtitle.strip():
+        lines.append(f"_{subtitle.strip()}_")
+
+    content = article.get("content") or {}
+    blocks = content.get("blocks") if isinstance(content, dict) else None
+    if isinstance(blocks, list):
+        image_idx = 0
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            rendered, image_idx = _render_article_block(block, image_idx)
+            if rendered:
+                lines.append(rendered)
+
+    return "\n\n".join(lines)
+
+
+def _render_article_block(block: dict[str, Any], image_idx: int) -> tuple[str | None, int]:
+    """Render a single article block to markdown. Returns (md, new_image_idx)."""
+    btype = block.get("type")
+    text = block.get("text", "")
+
+    if btype == "heading":
+        depth = block.get("depth", 1)
+        try:
+            depth = max(1, min(6, int(depth)))
+        except (TypeError, ValueError):
+            depth = 2
+        return f"{'#' * depth} {text}".rstrip(), image_idx
+    if btype == "paragraph":
+        return str(text), image_idx
+    if btype == "image":
+        image_idx += 1
+        url = block.get("url")
+        if isinstance(url, str):
+            return f"![]({url})", image_idx
+        return f"[image {image_idx}]", image_idx
+    if btype == "list":
+        items = block.get("items")
+        if isinstance(items, list):
+            ordered = bool(block.get("ordered"))
+            prefix = "1." if ordered else "-"
+            lines = [f"{prefix} {item}" for item in items if isinstance(item, str)]
+            return "\n".join(lines) if lines else None, image_idx
+        return None, image_idx
+    if btype == "quote":
+        return f"> {text}", image_idx
+
+    # Unknown block type — fall back to its `text` if present, else skip
+    return (str(text) if text else None), image_idx
 
 
 __all__ = ["XExtractor"]
