@@ -33,6 +33,10 @@ from khiip.extractors.base import CaptureData, Extractor
 
 FXTWITTER_API = "https://api.fxtwitter.com/i/status/{tweet_id}"
 
+# fxtwitter blocks the default `python-httpx/*` User-Agent (returns 403).
+# Identify Khiip explicitly so the upstream operator can rate-limit / contact us.
+_USER_AGENT = "khiip-daemon/0.0.1 (+https://github.com/khiip-ai/khiip)"
+
 # X URL patterns: x.com/{user}/status/{id} or twitter.com/{user}/status/{id}
 _TWEET_ID_PATTERN = re.compile(r"/status/(\d+)")
 
@@ -46,7 +50,11 @@ class XExtractor:
     source: str = "x"
 
     def __init__(self, *, http_client: httpx.Client | None = None, timeout: float = 10.0) -> None:
-        self._http = http_client or httpx.Client(timeout=timeout, follow_redirects=True)
+        self._http = http_client or httpx.Client(
+            timeout=timeout,
+            follow_redirects=True,
+            headers={"User-Agent": _USER_AGENT, "Accept": "application/json"},
+        )
 
     def supports(self, url: str) -> bool:
         """True for x.com / twitter.com URLs that look like a status."""

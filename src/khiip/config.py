@@ -30,6 +30,7 @@ DATA_DIR = Path.home() / ".local" / "share" / "khiip"
 CONFIG_PATH = CONFIG_DIR / "config.toml"
 AUTH_PATH = CONFIG_DIR / "auth.toml"
 DB_PATH = DATA_DIR / "index.db"
+DEFAULT_VAULT_PATH = Path.home() / "khiip-vault"
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8478
@@ -42,7 +43,7 @@ class KhiipConfig:
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     db_path: Path = DB_PATH
-    vault_path: Path | None = None  # user-set; required for capture writes
+    vault_path: Path = DEFAULT_VAULT_PATH  # default to ~/khiip-vault/; user-configurable via config.toml
 
 
 def _generate_api_key() -> str:
@@ -88,12 +89,12 @@ def load_config(config_path: Path | None = None) -> KhiipConfig:
 
     `config_path` defaults to the module-level `CONFIG_PATH` resolved at call
     time (so tests that monkeypatch `CONFIG_PATH` are honored). Same applies
-    to the db_path default — falls back to the live `DB_PATH` constant.
+    to the db_path + vault_path defaults — fall back to live module constants.
     """
     if config_path is None:
         config_path = CONFIG_PATH
     if not config_path.exists():
-        return KhiipConfig(db_path=DB_PATH)
+        return KhiipConfig(db_path=DB_PATH, vault_path=DEFAULT_VAULT_PATH)
 
     with config_path.open("rb") as f:
         data = tomllib.load(f)
@@ -103,7 +104,7 @@ def load_config(config_path: Path | None = None) -> KhiipConfig:
         host=daemon.get("host", DEFAULT_HOST),
         port=int(daemon.get("port", DEFAULT_PORT)),
         db_path=Path(daemon.get("db_path", str(DB_PATH))).expanduser(),
-        vault_path=Path(daemon["vault_path"]).expanduser() if "vault_path" in daemon else None,
+        vault_path=Path(daemon.get("vault_path", str(DEFAULT_VAULT_PATH))).expanduser(),
     )
 
 
@@ -135,6 +136,7 @@ __all__ = [
     "DB_PATH",
     "DEFAULT_HOST",
     "DEFAULT_PORT",
+    "DEFAULT_VAULT_PATH",
     "KhiipConfig",
     "auth_key_fingerprint",
     "ensure_auth",

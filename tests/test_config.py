@@ -52,8 +52,9 @@ def test_fingerprint_truncates(isolated_paths):
 
 
 def test_load_config_returns_defaults_when_missing(isolated_paths):
-    """No config file → defaults (host 127.0.0.1, port 8478)."""
+    """No config file → defaults (host 127.0.0.1, port 8478, default vault dir)."""
     cfg = load_config(config_path=isolated_paths["config_dir"] / "config.toml")
     assert cfg.host == "127.0.0.1"
     assert cfg.port == 8478
-    assert cfg.vault_path is None
+    # vault_path defaults to ~/khiip-vault/ (monkeypatched in isolated_paths)
+    assert cfg.vault_path == isolated_paths["vault_dir"]
