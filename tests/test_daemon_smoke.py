@@ -340,6 +340,10 @@ def test_post_capture_writes_embedding_row(isolated_paths):
         assert row["dimension"] == app.state.embedder.dimension
         assert row["vector"].shape == (app.state.embedder.dimension,)
 
+        # In-memory recall cache stays in sync with the persisted row.
+        cached_ids = [r.capture_id for r in app.state.embedding_records]
+        assert capture_id in cached_ids
+
 
 def test_recall_returns_topic_matched_capture_first(isolated_paths):
     """Recall ranks captures sharing query tokens above unrelated ones."""

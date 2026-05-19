@@ -36,6 +36,25 @@ def find_capture_by_id(conn: sqlite3.Connection, capture_id: str) -> Capture | N
     return _row_to_capture(row) if row else None
 
 
+def find_captures_by_ids(
+    conn: sqlite3.Connection, capture_ids: list[str]
+) -> dict[str, Capture]:
+    """Batch-fetch captures by ID. Returns dict keyed by id; missing ids absent.
+
+    Single SQL call instead of N — used by recall to hydrate top-k hits.
+    Preserves the same Capture-or-skip semantics as N parallel find_capture_by_id
+    calls (a missing capture for an embedding row means cascade-delete happened
+    between embedding insert and recall; legitimate to skip).
+    """
+    if not capture_ids:
+        return {}
+    placeholders = ",".join("?" * len(capture_ids))
+    rows = conn.execute(
+        f"SELECT * FROM captures WHERE id IN ({placeholders})", capture_ids
+    ).fetchall()
+    return {row["id"]: _row_to_capture(row) for row in rows}
+
+
 def list_captures(
     conn: sqlite3.Connection,
     *,
@@ -133,6 +152,7 @@ def _parse_iso(value: str) -> datetime:
 __all__ = [
     "find_capture_by_id",
     "find_capture_by_url_hash",
+    "find_captures_by_ids",
     "hash_url",
     "insert_capture",
     "list_captures",

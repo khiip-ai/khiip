@@ -20,6 +20,7 @@ import hashlib
 import os
 
 import httpx
+import numpy as np
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from ulid import ULID
 
@@ -134,6 +135,15 @@ async def lifespan(app: FastAPI):
         logger.info("embedder ready: %s (dim=%d)", embedder.model_name, embedder.dimension)
     except Exception:
         logger.exception("embedder warmup failed; recall will return empty until resolved")
+
+    # Load existing embeddings into memory once at startup; subsequent inserts
+    # append to this list, so /api/v1/recall never re-hits SQLite for the corpus.
+    # ADR-0007 Probe 3 sized SQLite at 50K rows; this cache keeps the hot path
+    # at numpy stack + cosine on the in-memory matrix.
+    app.state.embedding_records = embeddings_store.load_all_vectors(
+        conn, model=embedder.model_name
+    )
+    logger.info("embedding cache loaded: %d records", len(app.state.embedding_records))
 
     try:
         yield
@@ -287,6 +297,16 @@ def create_app() -> FastAPI:
                         vector=vector,
                         content_sha256=hashlib.sha256(embed_text.encode("utf-8")).hexdigest(),
                     )
+                # Keep the in-memory recall cache in sync with the persisted row.
+                # Single-method list.append is GIL-atomic; concurrent POSTs cannot
+                # corrupt the list (a parallel recall may miss the new record by
+                # one request, which is acceptable).
+                app.state.embedding_records.append(
+                    embeddings_store.EmbeddingRecord(
+                        capture_id=capture_id,
+                        vector=np.asarray(vector, dtype=np.float32),
+                    )
+                )
             except Exception:
                 logger.exception(
                     "embedding failed for capture %s; capture preserved, recall will skip it",
@@ -344,7 +364,7 @@ def create_app() -> FastAPI:
         embedder: Embedder = app.state.embedder
         conn = app.state.db
 
-        records = embeddings_store.load_all_vectors(conn, model=embedder.model_name)
+        records = app.state.embedding_records
         if not records:
             return RecallResponse(
                 query=q,
@@ -364,9 +384,11 @@ def create_app() -> FastAPI:
 
         ranked = embeddings_store.cosine_topk(query_vector, records, limit=limit)
 
+        hit_ids = [capture_id for capture_id, _ in ranked]
+        captures_by_id = storage_captures.find_captures_by_ids(conn, hit_ids)
         hits: list[RecallHit] = []
         for capture_id, score in ranked:
-            capture = storage_captures.find_capture_by_id(conn, capture_id)
+            capture = captures_by_id.get(capture_id)
             if capture is None:  # embedding outlived its capture (cascade deletes guard this)
                 continue
             hits.append(RecallHit(capture=capture, score=score))
