@@ -24,13 +24,53 @@ except ImportError:  # pragma: no cover
 
 import tomli_w
 
-CONFIG_DIR = Path.home() / ".config" / "khiip"
-DATA_DIR = Path.home() / ".local" / "share" / "khiip"
+def _resolve_root() -> Path | None:
+    """`KHIIP_HOME` if set — a dev/test override. Production users do not set this.
+
+    GUI-launched processes (Obsidian plugin, Claude Desktop MCP server) on macOS
+    do NOT inherit shell env vars from launchd. Setting `KHIIP_HOME` in `.zshrc`
+    will desync the daemon from those clients silently. Treat as per-invocation only.
+    """
+    value = os.environ.get("KHIIP_HOME")
+    if not value:
+        return None
+    return Path(value).expanduser().resolve()
+
+
+def _resolve_config_dir() -> Path:
+    root = _resolve_root()
+    if root is not None:
+        return root / "config"
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return Path(xdg).expanduser() / "khiip"
+    return Path.home() / ".config" / "khiip"
+
+
+def _resolve_data_dir() -> Path:
+    root = _resolve_root()
+    if root is not None:
+        return root / "data"
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg:
+        return Path(xdg).expanduser() / "khiip"
+    return Path.home() / ".local" / "share" / "khiip"
+
+
+def _resolve_vault_path() -> Path:
+    root = _resolve_root()
+    if root is not None:
+        return root / "vault"
+    return Path.home() / "khiip-vault"
+
+
+CONFIG_DIR = _resolve_config_dir()
+DATA_DIR = _resolve_data_dir()
 
 CONFIG_PATH = CONFIG_DIR / "config.toml"
 AUTH_PATH = CONFIG_DIR / "auth.toml"
 DB_PATH = DATA_DIR / "index.db"
-DEFAULT_VAULT_PATH = Path.home() / "khiip-vault"
+DEFAULT_VAULT_PATH = _resolve_vault_path()
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8478

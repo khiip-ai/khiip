@@ -17,13 +17,20 @@ from contextlib import asynccontextmanager
 from typing import Annotated
 
 import hashlib
+import os
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from ulid import ULID
 
 from khiip.auth import verify_bearer
-from khiip.config import KhiipConfig, auth_key_fingerprint, ensure_auth, load_config
+from khiip.config import (
+    CONFIG_DIR,
+    KhiipConfig,
+    auth_key_fingerprint,
+    ensure_auth,
+    load_config,
+)
 from khiip.embeddings import Embedder, MiniLMEmbedder
 from khiip.extractors import ExtractorRegistry, XExtractor
 from khiip.extractors.base import CaptureData
@@ -88,6 +95,16 @@ async def lifespan(app: FastAPI):
     """
     cfg: KhiipConfig = load_config()
     app.state.config = cfg
+
+    if os.environ.get("KHIIP_HOME"):
+        logger.warning("=" * 64)
+        logger.warning("KHIIP_HOME override in effect — dev/test mode")
+        logger.warning("  config:  %s", CONFIG_DIR)
+        logger.warning("  data:    %s", cfg.db_path.parent)
+        logger.warning("  vault:   %s", cfg.vault_path)
+        logger.warning("Production users should not set KHIIP_HOME.")
+        logger.warning("GUI clients (Obsidian, Claude Desktop) do NOT see this override.")
+        logger.warning("=" * 64)
 
     api_key = ensure_auth()
     app.state.api_key = api_key

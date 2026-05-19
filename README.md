@@ -64,6 +64,28 @@ Same daemon, multiple surfaces. See [ADR-0003](docs/adr/ADR-0003-strategic-posit
 
 ---
 
+## Development — running tests and smokes
+
+Default paths:
+
+| Purpose | Path | Override |
+|---|---|---|
+| Config | `~/.config/khiip/` | `XDG_CONFIG_HOME` (Unix convention) |
+| Data (SQLite index) | `~/.local/share/khiip/` | `XDG_DATA_HOME` |
+| Vault (Markdown captures) | `~/khiip-vault/` | configurable per source in `config.toml` |
+
+For **dev/test smokes only**, set `KHIIP_HOME` to redirect all three under one root:
+
+```bash
+make test            # hermetic pytest suite, ~1s
+make smoke           # full live round-trip against fxtwitter + fastembed
+                     # internally: KHIIP_HOME=$(mktemp -d) khiipd serve ...
+```
+
+**Do not set `KHIIP_HOME` in your shell rc.** macOS GUI applications (Obsidian, Claude Desktop, future MCP server) do not inherit shell environment variables from `launchd`-launched processes — the daemon and your plugin would silently disagree on workspace. `KHIIP_HOME` is a per-invocation knob for tests and demos, not a user setting.
+
+---
+
 ## Read order for deeper context
 
 If you're evaluating Khiip as a contributor, integrator, or potential user, read the architectural decision records in this order:
