@@ -41,6 +41,8 @@ dependencies = [
     "fastembed>=0.4,<1",
     "numpy>=1.26,<3",
     "trafilatura>=2.0,<3",
+    "readability-lxml>=0.8,<1",
+    "markdownify>=1.0,<2",
 ]
 
 
