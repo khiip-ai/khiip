@@ -58,3 +58,51 @@ def test_load_config_returns_defaults_when_missing(isolated_paths):
     assert cfg.port == 8478
     # vault_path defaults to ~/khiip-vault/ (monkeypatched in isolated_paths)
     assert cfg.vault_path == isolated_paths["vault_dir"]
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Per-extractor opt-in credentials — youtube_api_key resolution
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_load_config_youtube_api_key_none_when_unset(isolated_paths, monkeypatch):
+    """No env var + no config.toml → youtube_api_key is None (2-source chain)."""
+    monkeypatch.delenv("KHIIP_YOUTUBE_API_KEY", raising=False)
+    cfg = load_config(config_path=isolated_paths["config_dir"] / "config.toml")
+    assert cfg.youtube_api_key is None
+
+
+def test_load_config_youtube_api_key_from_env_var(isolated_paths, monkeypatch):
+    """KHIIP_YOUTUBE_API_KEY env var populates the dataclass field."""
+    monkeypatch.setenv("KHIIP_YOUTUBE_API_KEY", "AIza_from_env")
+    cfg = load_config(config_path=isolated_paths["config_dir"] / "config.toml")
+    assert cfg.youtube_api_key == "AIza_from_env"
+
+
+def test_load_config_youtube_api_key_from_config_toml(isolated_paths, monkeypatch):
+    """[extractors.youtube] api_key in config.toml populates the dataclass field."""
+    monkeypatch.delenv("KHIIP_YOUTUBE_API_KEY", raising=False)
+    config_path = isolated_paths["config_dir"] / "config.toml"
+    config_path.write_text(
+        "[extractors.youtube]\napi_key = \"AIza_from_file\"\n"
+    )
+    cfg = load_config(config_path=config_path)
+    assert cfg.youtube_api_key == "AIza_from_file"
+
+
+def test_load_config_youtube_api_key_env_wins_over_config_toml(isolated_paths, monkeypatch):
+    """Env var precedence: both set → env var value wins."""
+    monkeypatch.setenv("KHIIP_YOUTUBE_API_KEY", "AIza_from_env")
+    config_path = isolated_paths["config_dir"] / "config.toml"
+    config_path.write_text(
+        "[extractors.youtube]\napi_key = \"AIza_from_file\"\n"
+    )
+    cfg = load_config(config_path=config_path)
+    assert cfg.youtube_api_key == "AIza_from_env"
+
+
+def test_load_config_youtube_api_key_empty_string_treated_as_none(isolated_paths, monkeypatch):
+    """Empty-string env var falls back to config.toml (which is also missing → None)."""
+    monkeypatch.setenv("KHIIP_YOUTUBE_API_KEY", "")
+    cfg = load_config(config_path=isolated_paths["config_dir"] / "config.toml")
+    assert cfg.youtube_api_key is None

@@ -33,7 +33,13 @@ from khiip.config import (
     load_config,
 )
 from khiip.embeddings import Embedder, MiniLMEmbedder
-from khiip.extractors import ExtractorRegistry, PdfExtractor, WebExtractor, XExtractor
+from khiip.extractors import (
+    ExtractorRegistry,
+    PdfExtractor,
+    WebExtractor,
+    XExtractor,
+    YouTubeExtractor,
+)
 from khiip.extractors.base import CaptureData
 from khiip.extractors.resilience import (
     ExtractorError,
@@ -57,15 +63,22 @@ from khiip.version import __version__
 logger = logging.getLogger("khiip.daemon")
 
 
-def _build_default_registry() -> ExtractorRegistry:
+def _build_default_registry(cfg: KhiipConfig | None = None) -> ExtractorRegistry:
     """Build the default extractor registry. Factored for test override.
 
     Order matters: registry.find() returns the FIRST extractor whose
     supports(url) is True. Domain-specific extractors must register
     BEFORE WebExtractor's catch-all http(s) handler.
+
+    `cfg` is honored for extractors that consume operator-opt-in credentials
+    (e.g. YouTube Data API v3 key). When `cfg` is None, all extractors use
+    their zero-config defaults (chain stays narrower).
     """
     registry = ExtractorRegistry()
     registry.register(XExtractor())  # x.com / twitter.com
+    registry.register(YouTubeExtractor(  # youtube.com / m.youtube.com / youtu.be
+        api_key=cfg.youtube_api_key if cfg else None
+    ))
     registry.register(PdfExtractor())  # *.pdf URLs — before WebExtractor's http(s) catch-all
     registry.register(WebExtractor())  # generic http(s) fallback — keep last
     return registry
@@ -135,7 +148,7 @@ async def lifespan(app: FastAPI):
     # Tests may pre-populate app.state.extractors via dependency-override-style
     # assignment before triggering lifespan; respect that.
     if not hasattr(app.state, "extractors"):
-        app.state.extractors = _build_default_registry()
+        app.state.extractors = _build_default_registry(cfg)
     logger.info("extractors registered: %d", len(app.state.extractors))
 
     # Same injection pattern for the embedder — tests inject StubEmbedder

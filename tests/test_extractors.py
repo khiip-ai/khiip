@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import MagicMock
 
 import httpx
@@ -1374,3 +1375,729 @@ def test_registry_order_pdf_claims_pdf_urls_before_web():
     found_x = registry.find("https://x.com/jack/status/20")
     assert found_x is not None
     assert found_x.source == "x"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# YouTubeExtractor — yt-dlp → youtube-transcript-api+oEmbed → (key) API v3
+# ─────────────────────────────────────────────────────────────────────
+
+from khiip.extractors.youtube import (
+    YouTubeExtractor,
+    _api_v3_engagement,
+    _compose_body,
+    _extract_video_id,
+    _parse_iso_zulu,
+    _parse_json3_transcript,
+    _parse_srt_transcript,
+    _parse_vtt_transcript,
+    _parse_ytdlp_date,
+    _ytdlp_engagement,
+)
+
+
+@pytest.mark.parametrize(
+    "url, expected",
+    [
+        ("https://www.youtube.com/watch?v=fNk_zzaMoSs", True),
+        ("https://youtube.com/watch?v=fNk_zzaMoSs", True),
+        ("https://m.youtube.com/watch?v=fNk_zzaMoSs", True),
+        ("https://youtu.be/fNk_zzaMoSs", True),
+        ("https://www.youtube.com/shorts/abc123def456", True),
+        ("https://www.youtube.com/watch?v=fNk_zzaMoSs&t=10s", True),
+        # Out of v0 scope (locked):
+        ("https://music.youtube.com/watch?v=fNk_zzaMoSs", False),
+        ("https://www.youtube.com/playlist?list=PLAAA", False),  # no video id
+        ("https://www.youtube.com/", False),  # no video
+        ("https://example.com/watch?v=fNk_zzaMoSs", False),  # wrong host
+        ("not-a-url", False),
+        ("", False),
+    ],
+)
+def test_youtube_supports(url: str, expected: bool) -> None:
+    assert YouTubeExtractor().supports(url) is expected
+
+
+def test_extract_video_id_handles_all_variants():
+    assert _extract_video_id("https://www.youtube.com/watch?v=fNk_zzaMoSs") == "fNk_zzaMoSs"
+    assert _extract_video_id("https://www.youtube.com/watch?t=10&v=abc123def45") == "abc123def45"
+    assert _extract_video_id("https://youtu.be/jNQXAC9IVRw") == "jNQXAC9IVRw"
+    assert _extract_video_id("https://www.youtube.com/shorts/short_id_xx") == "short_id_xx"
+    assert _extract_video_id("https://www.youtube.com/embed/abcDEF12345") == "abcDEF12345"
+    assert _extract_video_id("https://www.youtube.com/profile") is None
+    assert _extract_video_id("garbage") is None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Date + engagement + body helpers
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_parse_ytdlp_date_handles_yyyymmdd():
+    dt = _parse_ytdlp_date("20160806")
+    assert dt is not None
+    assert (dt.year, dt.month, dt.day) == (2016, 8, 6)
+    assert dt.tzinfo is not None  # UTC stamped
+
+
+def test_parse_ytdlp_date_rejects_invalid():
+    assert _parse_ytdlp_date(None) is None
+    assert _parse_ytdlp_date("") is None
+    assert _parse_ytdlp_date("2016-08-06") is None  # wrong format (hyphens)
+    assert _parse_ytdlp_date("not a date") is None
+    assert _parse_ytdlp_date("20161306") is None  # invalid month
+    assert _parse_ytdlp_date("2016080") is None  # 7 chars not 8
+
+
+def test_parse_iso_zulu_handles_iso_z():
+    dt = _parse_iso_zulu("2026-05-19T12:00:00Z")
+    assert dt is not None
+    assert (dt.year, dt.month, dt.day) == (2026, 5, 19)
+
+
+def test_parse_iso_zulu_returns_none_on_garbage():
+    assert _parse_iso_zulu(None) is None
+    assert _parse_iso_zulu("") is None
+    assert _parse_iso_zulu("nope") is None
+
+
+def test_ytdlp_engagement_skips_non_ints():
+    info = {"view_count": 1000, "like_count": None, "comment_count": "junk"}
+    assert _ytdlp_engagement(info) == {"views": 1000}
+
+
+def test_ytdlp_engagement_includes_all_when_present():
+    info = {"view_count": 1000, "like_count": 50, "comment_count": 10}
+    assert _ytdlp_engagement(info) == {"views": 1000, "likes": 50, "comments": 10}
+
+
+def test_api_v3_engagement_coerces_strings_to_ints():
+    """API v3 returns counts as strings (legacy JSON shape); coerce."""
+    stats = {"viewCount": "1000", "likeCount": "50", "commentCount": "10"}
+    assert _api_v3_engagement(stats) == {"views": 1000, "likes": 50, "comments": 10}
+
+
+def test_api_v3_engagement_skips_missing():
+    """Some fields can be missing on private/limited videos."""
+    assert _api_v3_engagement({"viewCount": "1000"}) == {"views": 1000}
+    assert _api_v3_engagement({}) == {}
+
+
+def test_compose_body_description_only():
+    assert _compose_body("A nice video.", None) == "A nice video."
+    assert _compose_body("A nice video.", "") == "A nice video."
+
+
+def test_compose_body_transcript_under_heading():
+    body = _compose_body("Description.", "Transcript text.")
+    assert "Description." in body
+    assert "## Transcript" in body
+    assert "Transcript text." in body
+    # Description comes first
+    assert body.index("Description.") < body.index("## Transcript")
+
+
+def test_compose_body_transcript_only_no_description():
+    body = _compose_body(None, "Just the transcript.")
+    assert "## Transcript" in body
+    assert "Just the transcript." in body
+
+
+def test_compose_body_both_empty_returns_empty():
+    assert _compose_body(None, None) == ""
+    assert _compose_body("", "") == ""
+    assert _compose_body("   ", "   ") == ""
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Subtitle parsers
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_parse_json3_transcript_joins_utf8_across_events():
+    data = {
+        "events": [
+            {"tStartMs": 0, "segs": [{"utf8": "Hello"}, {"utf8": " world"}]},
+            {"tStartMs": 1000, "segs": [{"utf8": "How are you"}]},
+        ]
+    }
+    assert _parse_json3_transcript(data) == "Hello world How are you"
+
+
+def test_parse_json3_transcript_tolerates_garbage():
+    assert _parse_json3_transcript(None) == ""
+    assert _parse_json3_transcript({}) == ""
+    assert _parse_json3_transcript({"events": "not a list"}) == ""
+    assert _parse_json3_transcript({"events": [{"segs": "bad"}]}) == ""
+
+
+def test_parse_vtt_transcript_strips_cue_headers_and_tags():
+    vtt = """WEBVTT
+Kind: captions
+Language: en
+
+00:00:00.000 --> 00:00:05.000
+Hello <c.colorE5E5E5>world</c>
+
+00:00:05.000 --> 00:00:10.000
+<i>Italic</i> line two
+"""
+    result = _parse_vtt_transcript(vtt)
+    assert "Hello world" in result
+    assert "Italic line two" in result
+    assert "WEBVTT" not in result
+    assert "00:00:00" not in result
+    assert "<c." not in result
+
+
+def test_parse_vtt_transcript_empty_input():
+    assert _parse_vtt_transcript("") == ""
+
+
+def test_parse_srt_transcript_strips_index_and_timecodes():
+    srt = """1
+00:00:00,000 --> 00:00:05,000
+Hello world
+
+2
+00:00:05,000 --> 00:00:10,000
+Line two
+"""
+    result = _parse_srt_transcript(srt)
+    assert "Hello world" in result
+    assert "Line two" in result
+    assert "00:00:00" not in result
+    # Cue indexes (just digits on a line) stripped
+    assert " 1 " not in f" {result} "
+    assert " 2 " not in f" {result} "
+
+
+# ─────────────────────────────────────────────────────────────────────
+# yt-dlp branch
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _stub_ydl_factory(info: dict[str, Any] | Exception):
+    """Build a yt-dlp factory stub that returns `info` (or raises) from extract_info.
+
+    Production calls `with YoutubeDL(opts) as ydl:`, so the factory must return
+    an object that supports the context-manager protocol AND `extract_info`.
+    """
+
+    class _StubYDL:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def extract_info(self, url, download=False):
+            if isinstance(info, Exception):
+                raise info
+            return info
+
+    return lambda: _StubYDL()
+
+
+def _make_ytdlp_info(**overrides) -> dict[str, Any]:
+    """Minimal yt-dlp info dict matching the production shape."""
+    info = {
+        "title": "Vectors | Chapter 1, Essence of linear algebra",
+        "description": "Beginning the linear algebra series with the basics.",
+        "uploader": "3Blue1Brown",
+        "channel": "3Blue1Brown",
+        "channel_id": "UCYO_jab_esuFRV4b17AJtAw",
+        "channel_url": "https://www.youtube.com/@3blue1brown",
+        "upload_date": "20160806",
+        "duration": 591,
+        "view_count": 11_661_356,
+        "like_count": 225_766,
+        "comment_count": 3800,
+        "thumbnail": "https://i.ytimg.com/vi/fNk_zzaMoSs/hqdefault.jpg",
+        "categories": ["Education"],
+        "tags": ["math", "vectors"],
+        "subtitles": {},
+        "automatic_captions": {},
+    }
+    info.update(overrides)
+    return info
+
+
+def test_ytdlp_branch_happy_path_no_transcript():
+    """yt-dlp info + no subtitles → CaptureData with description as body, engagement set."""
+    info = _make_ytdlp_info()
+    extractor = YouTubeExtractor(ydl_factory=_stub_ydl_factory(info))
+
+    cap = extractor._parse_ytdlp("https://www.youtube.com/watch?v=fNk_zzaMoSs", "fNk_zzaMoSs")
+    assert cap.source == "youtube"
+    assert cap.title == "Vectors | Chapter 1, Essence of linear algebra"
+    assert cap.author == "3Blue1Brown"
+    assert cap.valid_from.year == 2016
+    assert cap.engagement_at_capture == {"views": 11_661_356, "likes": 225_766, "comments": 3800}
+    assert "Beginning the linear algebra series" in cap.body_markdown
+    assert cap.extracted_payload["channel_id"] == "UCYO_jab_esuFRV4b17AJtAw"
+    assert cap.extracted_payload["transcript_available"] is False
+
+
+def test_ytdlp_branch_happy_path_with_json3_transcript():
+    """yt-dlp surfaces an English json3 sub URL; we fetch + parse it."""
+    info = _make_ytdlp_info(subtitles={
+        "en": [{"ext": "json3", "url": "https://yt.example/sub.json3"}],
+    })
+    transcript_response = MagicMock(spec=httpx.Response)
+    transcript_response.raise_for_status = MagicMock()
+    transcript_response.json = MagicMock(return_value={
+        "events": [{"segs": [{"utf8": "Hello transcript world."}]}]
+    })
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=transcript_response)
+
+    extractor = YouTubeExtractor(
+        ydl_factory=_stub_ydl_factory(info),
+        http_client=client,
+    )
+    cap = extractor._parse_ytdlp("https://www.youtube.com/watch?v=fNk_zzaMoSs", "fNk_zzaMoSs")
+    assert "Hello transcript world" in cap.body_markdown
+    assert "## Transcript" in cap.body_markdown
+    assert cap.extracted_payload["transcript_available"] is True
+
+
+def test_ytdlp_branch_falls_back_to_automatic_captions():
+    """When `subtitles['en']` is missing, automatic_captions are used."""
+    info = _make_ytdlp_info(
+        subtitles={},
+        automatic_captions={"en": [{"ext": "json3", "url": "https://yt.example/auto.json3"}]},
+    )
+    transcript_response = MagicMock(spec=httpx.Response)
+    transcript_response.raise_for_status = MagicMock()
+    transcript_response.json = MagicMock(return_value={
+        "events": [{"segs": [{"utf8": "Auto transcript."}]}]
+    })
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=transcript_response)
+
+    extractor = YouTubeExtractor(
+        ydl_factory=_stub_ydl_factory(info),
+        http_client=client,
+    )
+    cap = extractor._parse_ytdlp("https://www.youtube.com/watch?v=stubvideo01", "x")
+    assert "Auto transcript" in cap.body_markdown
+
+
+def test_ytdlp_branch_subtitle_fetch_failure_degrades_to_description_only():
+    """Sub URL exists but HTTP fetch errors → body falls back to description; capture still succeeds."""
+    info = _make_ytdlp_info(subtitles={
+        "en": [{"ext": "json3", "url": "https://yt.example/sub.json3"}],
+    })
+    transcript_response = MagicMock(spec=httpx.Response)
+    transcript_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "500", request=MagicMock(), response=MagicMock()
+        )
+    )
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=transcript_response)
+
+    extractor = YouTubeExtractor(
+        ydl_factory=_stub_ydl_factory(info),
+        http_client=client,
+    )
+    cap = extractor._parse_ytdlp("https://www.youtube.com/watch?v=stubvideo01", "x")
+    # Description is non-empty in the stub info; capture succeeds with description-only body
+    assert "Beginning the linear algebra series" in cap.body_markdown
+    assert cap.extracted_payload["transcript_available"] is False
+
+
+def test_ytdlp_branch_raises_fallback_failed_when_ytdlp_errors():
+    """yt-dlp itself raising → FallbackFailed (let next source try)."""
+    extractor = YouTubeExtractor(ydl_factory=_stub_ydl_factory(RuntimeError("yt-dlp broke")))
+    with pytest.raises(FallbackFailed) as info:
+        extractor._parse_ytdlp("https://www.youtube.com/watch?v=stubvideo01", "x")
+    assert "yt-dlp raised" in str(info.value)
+    assert "RuntimeError" in str(info.value)
+
+
+def test_ytdlp_branch_raises_fallback_failed_on_no_transcript_no_description():
+    """yt-dlp returns metadata with empty description + no subs → FallbackFailed."""
+    info = _make_ytdlp_info(description="")
+    extractor = YouTubeExtractor(ydl_factory=_stub_ydl_factory(info))
+    with pytest.raises(FallbackFailed) as exc_info:
+        extractor._parse_ytdlp("https://www.youtube.com/watch?v=stubvideo01", "x")
+    assert "no transcript + no description" in str(exc_info.value)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# youtube-transcript-api + oEmbed branch
+# ─────────────────────────────────────────────────────────────────────
+
+
+class _FetchedSnippet:
+    """Minimal stand-in for youtube_transcript_api.FetchedTranscriptSnippet."""
+
+    def __init__(self, text: str):
+        self.text = text
+        self.start = 0.0
+        self.duration = 0.0
+
+
+class _StubTranscriptApi:
+    def __init__(self, snippets: list[str] | Exception):
+        self._snippets = snippets
+
+    def fetch(self, video_id, languages=None):
+        if isinstance(self._snippets, Exception):
+            raise self._snippets
+        return [_FetchedSnippet(s) for s in self._snippets]
+
+
+def _stub_oembed_response(*, title: str | None = "Stub Title", author: str | None = "Stub Author") -> MagicMock:
+    response = MagicMock(spec=httpx.Response)
+    response.raise_for_status = MagicMock()
+    response.json = MagicMock(return_value={
+        "title": title,
+        "author_name": author,
+        "author_url": "https://www.youtube.com/@stub",
+        "thumbnail_url": "https://i.ytimg.com/vi/x/hqdefault.jpg",
+    })
+    return response
+
+
+def test_transcript_api_branch_happy_path():
+    """transcript-api returns snippets + oEmbed returns title → CaptureData with transcript body."""
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=_stub_oembed_response())
+    api = _StubTranscriptApi(["First snippet.", "Second snippet."])
+
+    extractor = YouTubeExtractor(http_client=client, transcript_api=api)
+    cap = extractor._parse_transcript_api_with_oembed(
+        "https://www.youtube.com/watch?v=stubvideo01", "x"
+    )
+    assert cap.source == "youtube"
+    assert cap.title == "Stub Title"
+    assert cap.author == "Stub Author"
+    assert "First snippet" in cap.body_markdown
+    assert "Second snippet" in cap.body_markdown
+    assert "## Transcript" in cap.body_markdown
+    assert cap.engagement_at_capture is None  # oEmbed gives no engagement
+    assert cap.extracted_payload["transcript_available"] is True
+
+
+def test_transcript_api_branch_transcript_failure_recovers_with_oembed_metadata():
+    """Transcript-api raises (TranscriptsDisabled etc.) but oEmbed gives title → succeeds with no body."""
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=_stub_oembed_response())
+    api = _StubTranscriptApi(RuntimeError("TranscriptsDisabled"))
+
+    extractor = YouTubeExtractor(http_client=client, transcript_api=api)
+    cap = extractor._parse_transcript_api_with_oembed(
+        "https://www.youtube.com/watch?v=stubvideo01", "x"
+    )
+    # Metadata succeeded; transcript dimension degraded
+    assert cap.title == "Stub Title"
+    assert cap.extracted_payload["transcript_available"] is False
+
+
+def test_transcript_api_branch_both_failures_raise_fallback_failed():
+    """Transcript-api raises AND oEmbed has no title → FallbackFailed."""
+    no_title_response = MagicMock(spec=httpx.Response)
+    no_title_response.raise_for_status = MagicMock()
+    no_title_response.json = MagicMock(return_value={})  # empty oEmbed
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=no_title_response)
+    api = _StubTranscriptApi(RuntimeError("TranscriptsDisabled"))
+
+    extractor = YouTubeExtractor(http_client=client, transcript_api=api)
+    with pytest.raises(FallbackFailed) as info:
+        extractor._parse_transcript_api_with_oembed(
+            "https://www.youtube.com/watch?v=stubvideo01", "x"
+        )
+    assert "no transcript" in str(info.value)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# API v3 branch (key-gated)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _stub_api_v3_response(*, items=None) -> MagicMock:
+    response = MagicMock(spec=httpx.Response)
+    response.raise_for_status = MagicMock()
+    response.json = MagicMock(return_value={
+        "items": items if items is not None else [{
+            "snippet": {
+                "title": "API V3 Title",
+                "description": "API v3 description text.",
+                "channelTitle": "API V3 Channel",
+                "channelId": "UC_api_v3",
+                "publishedAt": "2024-06-01T12:00:00Z",
+            },
+            "statistics": {
+                "viewCount": "1000",
+                "likeCount": "50",
+                "commentCount": "10",
+            },
+        }],
+    })
+    return response
+
+
+def test_api_v3_branch_happy_path():
+    """Valid response → CaptureData with description-only body + transcript_available=False."""
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=_stub_api_v3_response())
+
+    extractor = YouTubeExtractor(api_key="AIza_test", http_client=client)
+    cap = extractor._parse_api_v3("https://www.youtube.com/watch?v=stubvideo01", "x")
+    assert cap.source == "youtube"
+    assert cap.title == "API V3 Title"
+    assert cap.description == "API v3 description text."
+    assert cap.author == "API V3 Channel"
+    assert cap.valid_from.year == 2024
+    assert cap.engagement_at_capture == {"views": 1000, "likes": 50, "comments": 10}
+    assert "API v3 description text" in cap.body_markdown
+    # No transcript on this branch — by design
+    assert "## Transcript" not in cap.body_markdown
+    assert cap.extracted_payload["transcript_available"] is False
+    assert "degraded_body" in cap.extracted_payload
+
+
+def test_api_v3_branch_no_items_raises_fallback_failed():
+    """API returned 200 but no matching video → FallbackFailed (video might be deleted)."""
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=_stub_api_v3_response(items=[]))
+
+    extractor = YouTubeExtractor(api_key="AIza_test", http_client=client)
+    with pytest.raises(FallbackFailed) as info:
+        extractor._parse_api_v3("https://www.youtube.com/watch?v=stubvideo01", "x")
+    assert "no items" in str(info.value)
+
+
+def test_api_v3_branch_http_error_raises_fallback_failed():
+    """API v3 5xx or 403 → FallbackFailed (chain ends here for v0; no further sources)."""
+    error_response = MagicMock(); error_response.status_code = 403
+    response = MagicMock(spec=httpx.Response)
+    response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError("403", request=MagicMock(), response=error_response)
+    )
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=response)
+
+    extractor = YouTubeExtractor(api_key="AIza_test", http_client=client)
+    with pytest.raises(FallbackFailed) as info:
+        extractor._parse_api_v3("https://www.youtube.com/watch?v=stubvideo01", "x")
+    assert "api-v3 HTTP 403" in str(info.value)
+
+
+def test_api_v3_branch_http_error_does_not_leak_api_key():
+    """SECURITY: httpx renders the full URL (incl. ?key=) in its error str.
+
+    The FallbackFailed message must NOT include the URL — the operator's
+    API key must never reach the 502 response body or daemon warning log.
+    """
+    fake_request = MagicMock()
+    fake_request.url = "https://www.googleapis.com/youtube/v3/videos?id=x&key=AIza_SUPER_SECRET_KEY"
+    fake_response = MagicMock(); fake_response.status_code = 403
+    response = MagicMock(spec=httpx.Response)
+    response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            f"Server error '403 Forbidden' for url '{fake_request.url}'",
+            request=fake_request,
+            response=fake_response,
+        )
+    )
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=response)
+
+    extractor = YouTubeExtractor(api_key="AIza_SUPER_SECRET_KEY", http_client=client)
+    with pytest.raises(FallbackFailed) as info:
+        extractor._parse_api_v3("https://www.youtube.com/watch?v=stubvideo01", "x")
+    # Message must NOT contain the API key — under any encoding.
+    assert "AIza_SUPER_SECRET_KEY" not in str(info.value)
+    assert "key=" not in str(info.value)
+    # But it MUST be informative enough for ops triage.
+    assert "403" in str(info.value)
+
+
+def test_api_v3_branch_request_error_does_not_leak_api_key():
+    """SECURITY: same redaction discipline for connection-level errors (httpx.RequestError)."""
+    fake_request = MagicMock()
+    fake_request.url = "https://www.googleapis.com/youtube/v3/videos?key=AIza_NETWORK_LEAK"
+    err = httpx.ConnectError("dns failure")
+    err.request = fake_request
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(side_effect=err)
+
+    extractor = YouTubeExtractor(api_key="AIza_NETWORK_LEAK", http_client=client)
+    with pytest.raises(FallbackFailed) as info:
+        extractor._parse_api_v3("https://www.youtube.com/watch?v=stubvideo01", "x")
+    assert "AIza_NETWORK_LEAK" not in str(info.value)
+    assert "ConnectError" in str(info.value)
+
+
+def test_api_v3_branch_defensive_guard_when_no_api_key():
+    """The defensive `if not self._api_key` branch — should never run in practice."""
+    extractor = YouTubeExtractor(api_key=None)
+    with pytest.raises(FallbackFailed) as info:
+        extractor._parse_api_v3("https://www.youtube.com/watch?v=stubvideo01", "x")
+    assert "without api_key" in str(info.value)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# extract() — fallback chain integration
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_youtube_extract_yt_dlp_wins_no_other_sources_called():
+    """Happy path: yt-dlp returns metadata → transcript-api never called."""
+    info = _make_ytdlp_info()
+    api = _StubTranscriptApi(RuntimeError("should-not-call"))
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock()  # should not be called for oembed
+
+    extractor = YouTubeExtractor(
+        ydl_factory=_stub_ydl_factory(info),
+        http_client=client,
+        transcript_api=api,
+    )
+    cap = extractor.extract("https://www.youtube.com/watch?v=fNk_zzaMoSs")
+    assert cap.extracted_payload.get("_extractor_source") == "yt-dlp"
+    # oEmbed not called (yt-dlp won; we never reached source 2)
+    client.get.assert_not_called()
+
+
+def test_youtube_extract_falls_to_transcript_api_when_ytdlp_errors():
+    """yt-dlp raises → transcript-api+oembed branch tries → wins."""
+    api = _StubTranscriptApi(["Recovered transcript."])
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=_stub_oembed_response())
+
+    extractor = YouTubeExtractor(
+        ydl_factory=_stub_ydl_factory(RuntimeError("yt-dlp broke")),
+        http_client=client,
+        transcript_api=api,
+    )
+    cap = extractor.extract("https://www.youtube.com/watch?v=stubvideo01")
+    assert cap.extracted_payload.get("_extractor_source") == "youtube-transcript-api+oembed"
+    assert "Recovered transcript" in cap.body_markdown
+
+
+def test_youtube_extract_2source_chain_both_fail_raises_extractor_error():
+    """No api_key → 2-source chain; both fail → ExtractorError."""
+    no_title_response = MagicMock(spec=httpx.Response)
+    no_title_response.raise_for_status = MagicMock()
+    no_title_response.json = MagicMock(return_value={})  # oEmbed empty
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=no_title_response)
+    api = _StubTranscriptApi(RuntimeError("TranscriptsDisabled"))
+
+    extractor = YouTubeExtractor(
+        ydl_factory=_stub_ydl_factory(RuntimeError("yt-dlp broke")),
+        http_client=client,
+        transcript_api=api,
+    )
+    with pytest.raises(ExtractorError) as info:
+        extractor.extract("https://www.youtube.com/watch?v=stubvideo01")
+    assert "yt-dlp" in info.value.reason
+    assert "youtube-transcript-api+oembed" in info.value.reason
+
+
+def test_youtube_extract_3source_chain_falls_through_to_api_v3():
+    """yt-dlp + transcript-api both fail; key set → API v3 saves it."""
+    # Two sequential httpx.get calls expected: oembed (empty) then API v3.
+    empty_oembed = MagicMock(spec=httpx.Response)
+    empty_oembed.raise_for_status = MagicMock()
+    empty_oembed.json = MagicMock(return_value={})
+
+    api_v3 = _stub_api_v3_response()
+
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(side_effect=[empty_oembed, api_v3])
+    api = _StubTranscriptApi(RuntimeError("TranscriptsDisabled"))
+
+    extractor = YouTubeExtractor(
+        api_key="AIza_test",
+        ydl_factory=_stub_ydl_factory(RuntimeError("yt-dlp broke")),
+        http_client=client,
+        transcript_api=api,
+    )
+    cap = extractor.extract("https://www.youtube.com/watch?v=stubvideo01")
+    assert cap.extracted_payload.get("_extractor_source") == "api-v3"
+    assert cap.title == "API V3 Title"
+
+
+def test_youtube_extract_chain_length_is_key_gated():
+    """No key → chain has 2 sources; key set → 3 sources. Surfaced via fallback_count on /health."""
+    ext_no_key = YouTubeExtractor(api_key=None, ydl_factory=_stub_ydl_factory(_make_ytdlp_info()))
+    ext_with_key = YouTubeExtractor(api_key="AIza_test", ydl_factory=_stub_ydl_factory(_make_ytdlp_info()))
+
+    # Trigger health_check to read fallback_count
+    assert ext_no_key.health_check().fallback_count == 2
+    assert ext_with_key.health_check().fallback_count == 3
+
+
+# ─────────────────────────────────────────────────────────────────────
+# health_check
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_youtube_health_check_ok_when_probe_returns_sentinel():
+    info = _make_ytdlp_info(title="Me at the zoo")
+    extractor = YouTubeExtractor(ydl_factory=_stub_ydl_factory(info))
+    status_obj = extractor.health_check()
+    assert status_obj.source == "youtube"
+    assert status_obj.ok is True
+    assert status_obj.degraded_reason is None
+    assert status_obj.fallback_count == 2
+
+
+def test_youtube_health_check_degraded_on_title_mismatch():
+    """When the test ydl_factory returns a non-sentinel title, probe reports degraded.
+
+    Note: production health_check is a local library-readiness probe (no external
+    call); the title-sentinel branch only fires for test-injected factories so
+    tests can still assert on the title-mismatch failure mode.
+    """
+    info = _make_ytdlp_info(title="some unrelated title")
+    extractor = YouTubeExtractor(ydl_factory=_stub_ydl_factory(info))
+    status_obj = extractor.health_check()
+    assert status_obj.ok is False
+    assert "sentinel mismatch" in status_obj.degraded_reason
+
+
+def test_youtube_health_check_degraded_when_ytdlp_raises():
+    extractor = YouTubeExtractor(ydl_factory=_stub_ydl_factory(RuntimeError("upstream down")))
+    status_obj = extractor.health_check()
+    assert status_obj.ok is False
+    assert "yt-dlp probe raised" in status_obj.degraded_reason
+    assert "RuntimeError" in status_obj.degraded_reason
+
+
+def test_youtube_is_health_checkable_protocol():
+    """YouTubeExtractor satisfies the HealthCheckable Protocol at runtime."""
+    assert isinstance(YouTubeExtractor(), HealthCheckable)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Registry ordering: YouTube claims YT URLs before WebExtractor's catch-all
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_registry_order_youtube_claims_yt_urls_before_web():
+    """Without YouTubeExtractor first, youtube.com URLs would fall through to WebExtractor."""
+    registry = ExtractorRegistry()
+    registry.register(XExtractor())
+    registry.register(YouTubeExtractor())
+    registry.register(PdfExtractor())
+    registry.register(WebExtractor())
+
+    found_yt = registry.find("https://www.youtube.com/watch?v=fNk_zzaMoSs")
+    assert found_yt is not None
+    assert found_yt.source == "youtube"
+
+    found_youtu_be = registry.find("https://youtu.be/jNQXAC9IVRw")
+    assert found_youtu_be is not None
+    assert found_youtu_be.source == "youtube"
+
+    # Other routes still work
+    assert registry.find("https://example.com/article").source == "web"
+    assert registry.find("https://arxiv.org/pdf/x.pdf").source == "pdf"
+    assert registry.find("https://x.com/jack/status/20").source == "x"

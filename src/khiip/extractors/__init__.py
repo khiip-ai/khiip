@@ -14,6 +14,7 @@ from khiip.extractors.base import CaptureData, Extractor, ExtractorRegistry
 from khiip.extractors.pdf import PdfExtractor
 from khiip.extractors.web import WebExtractor
 from khiip.extractors.x import XExtractor
+from khiip.extractors.youtube import YouTubeExtractor
 
 __all__ = [
     "CaptureData",
@@ -22,4 +23,5 @@ __all__ = [
     "PdfExtractor",
     "WebExtractor",
     "XExtractor",
+    "YouTubeExtractor",
 ]

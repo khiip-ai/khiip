@@ -85,6 +85,11 @@ class KhiipConfig:
     db_path: Path = DB_PATH
     vault_path: Path = DEFAULT_VAULT_PATH  # default to ~/khiip-vault/; user-configurable via config.toml
 
+    # Per-extractor opt-in credentials. Read at daemon startup; passed to
+    # the corresponding extractor's constructor in _build_default_registry.
+    # When None, that extractor's fallback chain runs without the gated source.
+    youtube_api_key: str | None = None  # YouTube Data API v3 — operator-opt-in 3rd fallback source
+
 
 def _generate_api_key() -> str:
     """Generate a fresh API key. URL-safe base64; 32 bytes of entropy."""
@@ -124,17 +129,41 @@ def ensure_auth(auth_path: Path | None = None) -> str:
     return key
 
 
+def _resolve_youtube_api_key(data: dict) -> str | None:
+    """Env var (KHIIP_YOUTUBE_API_KEY) > config.toml [extractors.youtube] api_key > None.
+
+    Env var wins so CI / per-invocation overrides land cleanly. Config.toml
+    is the durable single-machine path. Both empty → 2-source chain; either
+    set → 3-source chain with API v3 as the 3rd fallback.
+    """
+    env_value = os.environ.get("KHIIP_YOUTUBE_API_KEY")
+    if env_value:
+        return env_value
+    extractors = data.get("extractors", {}) if isinstance(data.get("extractors"), dict) else {}
+    youtube = extractors.get("youtube", {}) if isinstance(extractors.get("youtube"), dict) else {}
+    api_key = youtube.get("api_key")
+    return api_key if isinstance(api_key, str) and api_key else None
+
+
 def load_config(config_path: Path | None = None) -> KhiipConfig:
     """Load `~/.config/khiip/config.toml` (creating defaults if missing).
 
     `config_path` defaults to the module-level `CONFIG_PATH` resolved at call
     time (so tests that monkeypatch `CONFIG_PATH` are honored). Same applies
     to the db_path + vault_path defaults — fall back to live module constants.
+
+    Per-extractor opt-in credentials (e.g. `youtube_api_key`) are also
+    resolved here via env-var-then-file precedence so the dataclass arrives
+    fully populated.
     """
     if config_path is None:
         config_path = CONFIG_PATH
     if not config_path.exists():
-        return KhiipConfig(db_path=DB_PATH, vault_path=DEFAULT_VAULT_PATH)
+        return KhiipConfig(
+            db_path=DB_PATH,
+            vault_path=DEFAULT_VAULT_PATH,
+            youtube_api_key=_resolve_youtube_api_key({}),
+        )
 
     with config_path.open("rb") as f:
         data = tomllib.load(f)
@@ -145,6 +174,7 @@ def load_config(config_path: Path | None = None) -> KhiipConfig:
         port=int(daemon.get("port", DEFAULT_PORT)),
         db_path=Path(daemon.get("db_path", str(DB_PATH))).expanduser(),
         vault_path=Path(daemon.get("vault_path", str(DEFAULT_VAULT_PATH))).expanduser(),
+        youtube_api_key=_resolve_youtube_api_key(data),
     )
 
 
