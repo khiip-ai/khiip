@@ -33,7 +33,7 @@ from khiip.config import (
     load_config,
 )
 from khiip.embeddings import Embedder, MiniLMEmbedder
-from khiip.extractors import ExtractorRegistry, WebExtractor, XExtractor
+from khiip.extractors import ExtractorRegistry, PdfExtractor, WebExtractor, XExtractor
 from khiip.extractors.base import CaptureData
 from khiip.extractors.resilience import (
     ExtractorError,
@@ -66,6 +66,7 @@ def _build_default_registry() -> ExtractorRegistry:
     """
     registry = ExtractorRegistry()
     registry.register(XExtractor())  # x.com / twitter.com
+    registry.register(PdfExtractor())  # *.pdf URLs — before WebExtractor's http(s) catch-all
     registry.register(WebExtractor())  # generic http(s) fallback — keep last
     return registry
 

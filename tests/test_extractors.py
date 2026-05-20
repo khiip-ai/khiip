@@ -935,3 +935,442 @@ def test_webextractor_health_check_degraded_on_empty_extraction():
     status_obj = WebExtractor(http_client=client).health_check()
     assert status_obj.ok is False
     assert "empty body" in status_obj.degraded_reason
+
+
+# ─────────────────────────────────────────────────────────────────────
+# PdfExtractor — markitdown → pdfplumber fallback chain
+# ─────────────────────────────────────────────────────────────────────
+
+from khiip.extractors.pdf import (
+    _HEALTH_PROBE_PDF,
+    _HEALTH_PROBE_SENTINEL,
+    PdfExtractor,
+    _build_probe_pdf,
+    _filename_from_url,
+    _parse_pdf_date,
+    _render_table_as_markdown,
+)
+
+
+@pytest.mark.parametrize(
+    "url, expected",
+    [
+        ("https://arxiv.org/pdf/2310.06770.pdf", True),
+        ("http://example.com/papers/x.PDF", True),
+        ("https://example.com/a/b/c.pdf", True),
+        # v0 lock: suffix-only matching. Extension-less PDF endpoints intentionally miss.
+        ("https://arxiv.org/pdf/2310.06770", False),
+        ("https://example.com/file.html", False),
+        ("https://example.com/x.pdf.html", False),  # not a PDF; mimetype mismatch
+        ("ftp://example.com/x.pdf", False),
+        ("file:///etc/passwd.pdf", False),
+        ("not-a-url", False),
+        ("", False),
+    ],
+)
+def test_pdfextractor_supports(url: str, expected: bool) -> None:
+    assert PdfExtractor().supports(url) is expected
+
+
+def test_pdfextractor_supports_handles_query_string():
+    """Query string after `.pdf` is fine; we look at path-suffix only."""
+    # urlparse path ends with `.pdf` even when there's a `?query` after.
+    assert PdfExtractor().supports("https://example.com/paper.pdf?download=1") is True
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_filename_from_url_strips_pdf_extension():
+    assert _filename_from_url("https://arxiv.org/pdf/2310.06770.pdf") == "2310.06770"
+    assert _filename_from_url("https://example.com/x.PDF") == "x"
+
+
+def test_filename_from_url_handles_no_path():
+    assert _filename_from_url("https://example.com") is None
+    assert _filename_from_url("not a url") is None or _filename_from_url("not a url") == "not a url"
+
+
+def test_parse_pdf_date_handles_z_suffix():
+    dt = _parse_pdf_date("D:20250115120000Z")
+    assert dt is not None
+    assert (dt.year, dt.month, dt.day, dt.hour) == (2025, 1, 15, 12)
+    assert dt.tzinfo is not None
+
+
+def test_parse_pdf_date_handles_offset_suffix():
+    dt = _parse_pdf_date("D:20250115120000+05'30'")
+    assert dt is not None
+    assert (dt.year, dt.month, dt.day) == (2025, 1, 15)
+    # Offset baked into tzinfo (5h30m east of UTC = +330 minutes)
+    assert dt.utcoffset() is not None
+    assert int(dt.utcoffset().total_seconds() / 60) == 330
+
+
+def test_parse_pdf_date_handles_negative_offset_suffix():
+    """Negative tz offset is symmetric with positive — verify it parses correctly."""
+    dt = _parse_pdf_date("D:20250115120000-05'00'")
+    assert dt is not None
+    assert int(dt.utcoffset().total_seconds() / 60) == -300
+
+
+def test_parse_pdf_date_returns_none_on_garbage():
+    assert _parse_pdf_date(None) is None
+    assert _parse_pdf_date("") is None
+    assert _parse_pdf_date("not a pdf date") is None
+    # Invalid month
+    assert _parse_pdf_date("D:20251315120000Z") is None
+
+
+def test_parse_pdf_date_rejects_trailing_garbage():
+    """Anchored regex rejects strings with trailing junk; protects valid_from from drift."""
+    # Trailing X after a date-prefix that would otherwise match — unanchored
+    # regex would silently swallow this as a valid date.
+    assert _parse_pdf_date("D:20250115120000Xjunk") is None
+    assert _parse_pdf_date("D:20250115120000Z extra") is None
+
+
+def test_render_table_as_markdown_basic_table():
+    md = _render_table_as_markdown([
+        ["col1", "col2"],
+        ["a", "b"],
+        ["c", "d"],
+    ])
+    assert md is not None
+    assert "| col1 | col2 |" in md
+    assert "| --- | --- |" in md
+    assert "| a | b |" in md
+
+
+def test_render_table_as_markdown_handles_none_cells_and_pipe_escapes():
+    md = _render_table_as_markdown([
+        ["h1", "h2"],
+        [None, "a|b"],
+    ])
+    assert md is not None
+    assert "|  | a\\|b |" in md  # None → empty; literal | escaped
+
+
+def test_render_table_as_markdown_empty_returns_none():
+    assert _render_table_as_markdown([]) is None
+    assert _render_table_as_markdown(None) is None
+    assert _render_table_as_markdown([[None, None]]) is None  # all-empty row
+
+
+def test_build_probe_pdf_is_a_valid_pdf_round_trip():
+    """The in-process probe PDF must parse with both libraries."""
+    import io
+
+    import pdfplumber
+    from markitdown import MarkItDown
+
+    pdf_bytes = _build_probe_pdf("Test sentinel content")
+    assert pdf_bytes.startswith(b"%PDF-")
+
+    md_text = MarkItDown().convert_stream(io.BytesIO(pdf_bytes)).text_content
+    assert "Test sentinel content" in (md_text or "")
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        text = pdf.pages[0].extract_text()
+    assert "Test sentinel content" in (text or "")
+
+
+def test_build_probe_pdf_with_metadata_round_trips_via_pdfplumber():
+    """A probe PDF with /Info Title + Author + CreationDate is readable via pdfplumber."""
+    import io
+
+    import pdfplumber
+
+    pdf_bytes = _build_probe_pdf(
+        "body text",
+        title="Probe Title",
+        author="Probe Author",
+        creation_date="D:20250115120000Z",
+    )
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        md = pdf.metadata
+    assert md.get("Title") == "Probe Title"
+    assert md.get("Author") == "Probe Author"
+    assert md.get("CreationDate") == "D:20250115120000Z"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# PdfExtractor — parser branches (offline, in-process PDFs)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _pdfextract_with_bytes(pdf_bytes: bytes, url: str = "https://example.com/paper.pdf") -> CaptureData:
+    """Helper: PdfExtractor with httpx mocked to return the given PDF bytes."""
+    response = MagicMock(spec=httpx.Response)
+    response.content = pdf_bytes
+    response.url = url
+    response.raise_for_status = MagicMock()
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=response)
+    return PdfExtractor(http_client=client).extract(url)
+
+
+def test_pdfextractor_markitdown_wins_on_normal_pdf():
+    """A PDF with normal text → markitdown extracts → pdfplumber not exercised for body."""
+    pdf_bytes = _build_probe_pdf("Hello from a normal PDF body.")
+    cap = _pdfextract_with_bytes(pdf_bytes)
+    assert cap.source == "pdf"
+    assert "Hello from a normal PDF body" in cap.body_markdown
+    assert cap.extracted_payload.get("_extractor_source") == "markitdown"
+    # Without /Info metadata, title falls back to URL filename
+    assert cap.title == "paper"
+
+
+def test_pdfextractor_uses_pdfplumber_metadata_even_when_markitdown_wins_body():
+    """Title + Author + valid_from come from /Info via pdfplumber on the markitdown branch."""
+    pdf_bytes = _build_probe_pdf(
+        "body content",
+        title="A Paper Title",
+        author="A Paper Author",
+        creation_date="D:20250115120000Z",
+    )
+    cap = _pdfextract_with_bytes(pdf_bytes)
+    assert cap.extracted_payload.get("_extractor_source") == "markitdown"
+    assert cap.title == "A Paper Title"
+    assert cap.author == "A Paper Author"
+    assert (cap.valid_from.year, cap.valid_from.month, cap.valid_from.day) == (2025, 1, 15)
+
+
+def test_pdfextractor_parse_pdfplumber_direct_extracts_metadata():
+    """Direct pdfplumber-branch call surfaces title + author + creation date."""
+    pdf_bytes = _build_probe_pdf(
+        "page text here",
+        title="Direct Title",
+        author="Direct Author",
+        creation_date="D:20240601000000Z",
+    )
+    cap = PdfExtractor()._parse_pdfplumber(
+        pdf_bytes,
+        canonical_url="https://example.com/x.pdf",
+        original_url="https://example.com/x.pdf",
+    )
+    assert cap.source == "pdf"
+    assert cap.title == "Direct Title"
+    assert cap.author == "Direct Author"
+    assert "page text here" in cap.body_markdown
+    assert cap.valid_from.year == 2024
+    assert cap.extracted_payload.get("page_count") == 1
+
+
+def test_pdfextractor_parse_pdfplumber_whitespace_only_title_falls_back_to_filename():
+    """Whitespace-only /Info Title must NOT crowd out the URL-filename fallback."""
+    pdf_bytes = _build_probe_pdf("body", title="   ", author="   ")
+    cap = PdfExtractor()._parse_pdfplumber(
+        pdf_bytes,
+        canonical_url="https://example.com/important-paper.pdf",
+        original_url="https://example.com/important-paper.pdf",
+    )
+    assert cap.title == "important-paper"
+    assert cap.author is None
+
+
+def test_pdfextractor_parse_markitdown_raises_fallback_failed_on_empty_body():
+    """markitdown returning empty text → FallbackFailed (let pdfplumber try)."""
+    from khiip.extractors.resilience import FallbackFailed
+
+    extractor = PdfExtractor()
+
+    # Stub markitdown to return empty text
+    class _EmptyResult:
+        text_content = ""
+        title = None
+
+    extractor._mid = MagicMock()
+    extractor._mid.convert_stream = MagicMock(return_value=_EmptyResult())
+
+    with pytest.raises(FallbackFailed) as info:
+        extractor._parse_markitdown(
+            b"%PDF-1.4 fake bytes", "https://example.com/x.pdf", "https://example.com/x.pdf"
+        )
+    assert "empty body" in str(info.value)
+
+
+def test_pdfextractor_parse_markitdown_raises_fallback_failed_on_internal_error():
+    """markitdown raising any exception → FallbackFailed (let pdfplumber try)."""
+    from khiip.extractors.resilience import FallbackFailed
+
+    extractor = PdfExtractor()
+    extractor._mid = MagicMock()
+    extractor._mid.convert_stream = MagicMock(side_effect=RuntimeError("parser exploded"))
+
+    with pytest.raises(FallbackFailed) as info:
+        extractor._parse_markitdown(
+            b"%PDF-1.4 fake bytes", "https://example.com/x.pdf", "https://example.com/x.pdf"
+        )
+    assert "markitdown raised" in str(info.value)
+    assert "RuntimeError" in str(info.value)
+
+
+def test_pdfextractor_parse_pdfplumber_raises_fallback_failed_on_garbage():
+    """pdfplumber on non-PDF bytes raises → wrapped as FallbackFailed."""
+    from khiip.extractors.resilience import FallbackFailed
+
+    with pytest.raises(FallbackFailed) as info:
+        PdfExtractor()._parse_pdfplumber(
+            b"not a pdf at all", "https://example.com/x.pdf", "https://example.com/x.pdf"
+        )
+    assert "pdfplumber raised" in str(info.value)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# PdfExtractor.extract — fallback chain integration
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_pdfextractor_extract_falls_to_pdfplumber_when_markitdown_returns_empty():
+    """markitdown gives empty body → pdfplumber takes over + wins."""
+    pdf_bytes = _build_probe_pdf("recoverable body content")
+    response = MagicMock(spec=httpx.Response)
+    response.content = pdf_bytes
+    response.url = "https://example.com/paper.pdf"
+    response.raise_for_status = MagicMock()
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=response)
+
+    extractor = PdfExtractor(http_client=client)
+
+    class _EmptyResult:
+        text_content = ""
+        title = None
+
+    extractor._mid = MagicMock()
+    extractor._mid.convert_stream = MagicMock(return_value=_EmptyResult())
+
+    cap = extractor.extract("https://example.com/paper.pdf")
+    assert cap.extracted_payload.get("_extractor_source") == "pdfplumber"
+    assert "recoverable body content" in cap.body_markdown
+
+
+def test_pdfextractor_extract_raises_extractor_error_when_both_parsers_fail():
+    """Both parsers FallbackFailed (markitdown empty + pdfplumber empty pages)."""
+    # A PDF that markitdown stubs to empty AND pdfplumber sees no extractable text.
+    # We can't easily make pdfplumber return empty on a valid PDF, so we stub
+    # the pdfplumber branch directly.
+    pdf_bytes = _build_probe_pdf("body")
+    response = MagicMock(spec=httpx.Response)
+    response.content = pdf_bytes
+    response.url = "https://example.com/x.pdf"
+    response.raise_for_status = MagicMock()
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=response)
+
+    extractor = PdfExtractor(http_client=client)
+
+    class _EmptyResult:
+        text_content = ""
+        title = None
+
+    extractor._mid = MagicMock()
+    extractor._mid.convert_stream = MagicMock(return_value=_EmptyResult())
+    # Force pdfplumber branch to also fail
+    extractor._parse_pdfplumber = MagicMock(  # type: ignore[method-assign]
+        side_effect=__import__("khiip.extractors.resilience", fromlist=["FallbackFailed"]).FallbackFailed(
+            "pdfplumber empty"
+        )
+    )
+
+    with pytest.raises(ExtractorError) as info:
+        extractor.extract("https://example.com/x.pdf")
+    assert "markitdown" in info.value.reason
+    assert "pdfplumber" in info.value.reason
+
+
+def test_pdfextractor_extract_rejects_non_pdf_response_before_dispatch():
+    """Upstream returns HTML (e.g. paywall behind a .pdf URL) → ExtractorError fast."""
+    response = MagicMock(spec=httpx.Response)
+    response.content = b"<html><body>Paywalled page, not a PDF</body></html>"
+    response.url = "https://example.com/paper.pdf"
+    response.raise_for_status = MagicMock()
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=response)
+
+    with pytest.raises(ExtractorError) as info:
+        PdfExtractor(http_client=client).extract("https://example.com/paper.pdf")
+    assert info.value.reason == "non-pdf-response"
+
+
+def test_pdfextractor_extract_propagates_http_error():
+    """4xx/5xx upstream → httpx error propagates (daemon turns into 502)."""
+    response = MagicMock(spec=httpx.Response)
+    response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError("404", request=MagicMock(), response=MagicMock())
+    )
+    client = MagicMock(spec=httpx.Client)
+    client.get = MagicMock(return_value=response)
+    with pytest.raises(httpx.HTTPStatusError):
+        PdfExtractor(http_client=client).extract("https://example.com/missing.pdf")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# PdfExtractor — health_check
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_pdfextractor_health_check_ok_on_normal_libraries():
+    """Real markitdown + the bundled probe PDF should round-trip the sentinel."""
+    status_obj = PdfExtractor().health_check()
+    assert status_obj.source == "pdf"
+    assert status_obj.ok is True
+    assert status_obj.degraded_reason is None
+    assert status_obj.fallback_count == 2
+
+
+def test_pdfextractor_health_check_degraded_when_sentinel_missing():
+    """markitdown returns text without the sentinel → degraded."""
+    extractor = PdfExtractor()
+
+    class _MismatchResult:
+        text_content = "completely different output"
+        title = None
+
+    extractor._mid = MagicMock()
+    extractor._mid.convert_stream = MagicMock(return_value=_MismatchResult())
+
+    status_obj = extractor.health_check()
+    assert status_obj.ok is False
+    assert "sentinel not found" in status_obj.degraded_reason
+
+
+def test_pdfextractor_is_health_checkable_protocol():
+    """PdfExtractor satisfies the HealthCheckable Protocol at runtime."""
+    assert isinstance(PdfExtractor(), HealthCheckable)
+
+
+def test_pdfextractor_probe_pdf_constant_starts_with_pdf_magic():
+    """Sanity: the module-level probe PDF really is a PDF."""
+    assert _HEALTH_PROBE_PDF.startswith(b"%PDF-")
+    assert _HEALTH_PROBE_SENTINEL.encode("latin-1") in _HEALTH_PROBE_PDF
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Registry ordering: PDF must claim .pdf URLs before Web's http(s) catch-all
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_registry_order_pdf_claims_pdf_urls_before_web():
+    """Without PdfExtractor first, .pdf URLs would fall through to WebExtractor."""
+    registry = ExtractorRegistry()
+    registry.register(XExtractor())
+    registry.register(PdfExtractor())
+    registry.register(WebExtractor())
+
+    found = registry.find("https://arxiv.org/pdf/2310.06770.pdf")
+    assert found is not None
+    assert found.source == "pdf"
+
+    # Non-PDF still routes to web
+    found_web = registry.find("https://example.com/article")
+    assert found_web is not None
+    assert found_web.source == "web"
+
+    # x.com still routes to X
+    found_x = registry.find("https://x.com/jack/status/20")
+    assert found_x is not None
+    assert found_x.source == "x"
